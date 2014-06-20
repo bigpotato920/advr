@@ -1,18 +1,73 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
+#include <net/if.h>
+#include <stdlib.h>
 
 #include "log.h"
 #include "route_engine.h"
 
+int init_ifs();
 int get_if_info(interface *cif);
 void get_broadcast(interface * cif);
+
+
+
 char *ip_to_str(in_addr_t ip)
 {
 	struct in_addr addr;
 	addr.s_addr = ip;
 
 	return inet_ntoa(addr);
+}
+
+/**
+ * initialize all the valid network interfaces
+ * @return 0 on success or -1 on failure
+ */
+int init_ifs(interface *if_head)
+{
+	int ifindex;
+	char ifname[IFNAMSIZ];
+	interface *cur_if = NULL;
+
+
+	for (ifindex = 1; if_indextoname(ifindex, ifname) != 0; ifindex++) {
+		cur_if = (interface*)malloc(sizeof(interface));
+		if (cur_if == NULL) {
+			log_err("Failed to create interface:%s", ifname);
+			return -1;
+		}
+		strcpy(cur_if->ifname, ifname);
+		cur_if->ifnumber = ifindex;
+		cur_if->active = 0;
+		if (get_if_info(cur_if) == -1) {
+			free(cur_if);
+			continue;
+		}
+		//insert the current interface to the head of the list
+		if (if_head == NULL) {
+
+			if_head = cur_if;
+			cur_if->next = NULL;
+		}
+		else {
+			cur_if->next = if_head;
+			if_head = cur_if;
+		}
+		
+	}
+
+	cur_if = if_head;
+	while (cur_if != NULL) {
+		debug("ifname = %s, ifnumber = %d, active = %d, ip = %s, network = %s,"
+			"mask = %s, broadcast = %s", cur_if->ifname, cur_if->ifnumber,
+			cur_if->active, ip_to_str(cur_if->ip), ip_to_str(cur_if->network),
+			ip_to_str(cur_if->mask), ip_to_str(cur_if->broadcast));
+		cur_if = cur_if->next;
+	}
+
+	return 0;
 }
 /**
  * get infomation about current network interface
@@ -87,4 +142,14 @@ void get_broadcast(interface *cif)
 
 	log_info("Broadcast is %s.", ip_to_str(cif->broadcast));
 	return;
+}
+
+
+
+
+int main(int argc, char const *argv[])
+{
+	interface *if_head = NULL;
+	init_ifs(if_head);
+	return 0;
 }
