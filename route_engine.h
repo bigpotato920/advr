@@ -12,5 +12,7 @@ typedef struct interface {
 	in_addr_t ip;//ip address
 	in_addr_t broadcast;//broadcast address
 	struct interface * next;
-	struct interface * prev;
+
 } interface;
+
+
