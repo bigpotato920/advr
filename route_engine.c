@@ -264,6 +264,12 @@ int set_if_fds(interface *cif)
 	return 0;
 }
 
+/**
+ * add local route entries to the route_entry list
+ * set the type to LOCAL_ROUTE_ENTRY, so the entry won't be expired
+ * set the expire_timer and holddown_timer to NOTUSED_TIMER
+ * @return 0 on success or -1 on failure
+ */
 int add_local_rtes()
 {
 	interface *cur_if = if_list;
