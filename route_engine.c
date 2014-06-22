@@ -22,34 +22,77 @@
 #define MAX_EPOLL_EVENTS 64
 #define MAX_RTE_NUM 25
 
+#define LOCAL_ROUTE_ENTRY 0
+#define NON_LOCAL_ROUTE_ENTRY 1
+#define VALID_ROUTE_ENTRY 0
+#define INVALID_ROUTE_ENTRY 1
+#define MAX_METRIC_COUNT 15
+#define NOTUSED_TIMER -1
+
+#define IP_STR_LEN 16
 #define SECOND_TO_MILLSECOND(second) (second * 1000)
 //a rip packet can contine 1 to 25(inclusize)rip route entry
 #define MAX_RIP_PACKET_SIZE (sizeof(rip_packet) + MAX_RTE_NUM * sizeof(rte))
 //return the rip_entry num contained in the rip packet
 #define get_rte_num(packet) ((sizeof(packet) - sizeof(rip_packet)) / sizeof(rte))
 
-int init_ifs();
-int add_local_rtes(route_entry *rte_list);
+int init_ifs(const char **active_ifs, int n);
+int add_local_rtes();
 int get_if_info(interface *cif);
 void get_broadcast(interface * cif);
 int set_if_fds(interface *cif);
 
+interface *if_list = NULL;
+route_entry *rte_list = NULL;
 
-char *ip_to_str(in_addr_t ip)
+int ip_to_str(in_addr_t ip, char *str)
 {
 	struct in_addr addr;
 	addr.s_addr = ip;
+	if (inet_ntop(AF_INET, &addr, str, IP_STR_LEN))
+		return 0;
+	log_err("inet_ntop");
+	return -1;
+}
 
-	return inet_ntoa(addr);
+void print_if(interface *cif)
+{
+	char ip[IP_STR_LEN];
+	char network[IP_STR_LEN];
+	char mask[IP_STR_LEN];
+	char broadcast[IP_STR_LEN];
+
+	assert(ip_to_str(cif->ip, ip) == 0);
+	assert(ip_to_str(cif->network, network) == 0);
+	assert(ip_to_str(cif->mask, mask) == 0);
+	assert(ip_to_str(cif->broadcast, broadcast) == 0);
+
+	debug("ifname = %s, ifnumber = %d,  active = %d, send_fd = %d, recv_fd = %d, ip = %s, network = %s,"
+		"mask = %s, broadcast = %s", cif->ifname, cif->ifnumber, cif->active, cif->send_fd,
+		cif->recv_fd,ip, network,mask, broadcast);
+}
+
+void print_rte(route_entry *rte)
+{
+	char dst[IP_STR_LEN];
+	char gateway[IP_STR_LEN];
+	char genmask[IP_STR_LEN];
+
+	assert(ip_to_str(rte->dst, dst) == 0);
+	assert(ip_to_str(rte->gateway, gateway) == 0);
+	assert(ip_to_str(rte->genmask, genmask) == 0);
+
+	debug("dst:%s, gateway:%s, genmask:%s, metric:%d, flags:%d, type:%d, expire_timer:%ld, holddown_timer:%ld", 
+		dst, gateway, genmask, rte->metric, rte->flags, rte->type, rte->expire_timer, rte->holddown_timer);
 }
 
 /**
  * insert all the valid active network interfaces to the interface list
- * @param if_head head of the interface list
+ * @param if_list head of the interface list
  * @param active_ifs name of the active network interface
  * @return 0 on success or -1 on failure
  */
-int init_ifs(interface *if_head, const char **active_ifs, int n)
+int init_ifs(const char **active_ifs, int n)
 {
 	int ifindex;
 	char ifname[IFNAMSIZ];
@@ -81,26 +124,23 @@ int init_ifs(interface *if_head, const char **active_ifs, int n)
 			}
 		}
 		//insert the current interface to the head of the list
-		if (if_head == NULL) {
+		if (if_list == NULL) {
 
-			if_head = cur_if;
+			if_list = cur_if;
 			cur_if->next = NULL;
 
 		} else {
-			cur_if->next = if_head;
-			if_head = cur_if;
+			cur_if->next = if_list;
+			if_list = cur_if;
 		}
 	}
 
-	cur_if = if_head;
+	cur_if = if_list;
 	while (cur_if != NULL) {
-		debug("ifname = %s, ifnumber = %d,  active = %d, send_fd = %d, recv_fd = %d, ip = %s, network = %s,"
-			"mask = %s, broadcast = %s", cur_if->ifname, cur_if->ifnumber, cur_if->active,
-			cur_if->send_fd, cur_if->recv_fd,ip_to_str(cur_if->ip), ip_to_str(cur_if->network),
-			ip_to_str(cur_if->mask), ip_to_str(cur_if->broadcast));
+		print_if(cur_if);
 		cur_if = cur_if->next;
 	}
-
+	assert(if_list != NULL);
 	return 0;
 }
 /**
@@ -143,7 +183,6 @@ int get_if_info(interface *cif)
 		return -1;
 	} else {
 		cif->ip = address->sin_addr.s_addr;
-		log_info("IP address is: %s", ip_to_str(cif->ip));
 	}
 
 	if ((ioctl(fd, SIOCGIFNETMASK, &ifreq)) == -1) {
@@ -151,11 +190,9 @@ int get_if_info(interface *cif)
 		return 0;
 	} else {
 		cif->mask = address->sin_addr.s_addr;
-		log_info("Netmask is %s.", ip_to_str(cif->mask));
 	}
 
 	cif->network = cif->ip & cif->mask;
-	log_info("NetID is %s.", ip_to_str(cif->network));
 	get_broadcast(cif);
 	if (set_if_fds(cif) == -1) {
         close(fd);
@@ -175,10 +212,8 @@ void get_broadcast(interface *cif)
 	uint32_t allOnes = 4294967295U; // (2^32)-1, all bits flipped on
 
 	hostmask = cif->mask ^ allOnes;
-	log_info("snmask = %u, hmask = %u", cif->mask, hostmask);
 	cif->broadcast = cif->network | hostmask;
 
-	log_info("Broadcast is %s.", ip_to_str(cif->broadcast));
 	return;
 }
 
@@ -229,15 +264,47 @@ int set_if_fds(interface *cif)
 	return 0;
 }
 
-int add_local_rtes(route_entry *rte_list)
+int add_local_rtes()
 {
+	interface *cur_if = if_list;
+	route_entry *cur_rte = NULL;
+	assert(cur_if != NULL);
 
+	while (cur_if) {
+		cur_rte = (route_entry*)malloc(sizeof(route_entry));
+		if (cur_rte == NULL) {
+			log_err("Failed to create route entry");
+			continue;
+		}
+		cur_rte->dst = cur_if->network;
+		cur_rte->genmask = cur_if->mask;
+		cur_rte->gateway = 0;
+		cur_rte->metric = 0;
+		cur_rte->type = LOCAL_ROUTE_ENTRY;
+		cur_rte->flags = VALID_ROUTE_ENTRY;
+		cur_rte->expire_timer = NOTUSED_TIMER;
+		cur_rte->holddown_timer = NOTUSED_TIMER;
+
+		if (rte_list == NULL) {
+			cur_rte->next = NULL;
+			rte_list = cur_rte;
+		} else {
+			cur_rte->next = rte_list;
+			rte_list = cur_rte;
+		}
+		cur_if = cur_if->next;
+	}
+
+	cur_rte = rte_list;
+	while (cur_rte) {
+		print_rte(cur_rte);
+		cur_rte = cur_rte->next;
+	}
+	return 0;
 }
 int start_route_service(interface *if_list)
 {
 	interface *cur_if = if_list;
-	route_entry *route_entry_list = NULL;
-	route_entry *holddown_list = NULL;
 
 	struct epoll_event event;
 	struct epoll_event *events;
@@ -301,10 +368,22 @@ int start_route_service(interface *if_list)
 
 int main(int argc, char const *argv[])
 {
-	interface *if_list = NULL;
 
 	const char *active_ifs[] = {"eth0", "vmnet1"};
-	init_ifs(if_list, active_ifs, 3);
+
+	int res;
+
+
+	res = init_ifs(active_ifs, 3);
+	if (res == -1) {
+		log_err("Failed to initialize all the interfaces");
+		exit(EXIT_FAILURE);
+	}
+	res = add_local_rtes();
+	if (res == -1) {
+		log_err("Failed to add local route entries");
+		exit(EXIT_FAILURE);
+	}
 	start_route_service(if_list);
 	return 0;
 }

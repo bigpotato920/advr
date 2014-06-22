@@ -48,8 +48,8 @@ typedef struct rip_packet {
 //timer expires, the route is deleted from the routing table.
 typedef struct route_entry {
 	in_addr_t dst;
-	in_addr_t dstmask;
-	in_addr_t nexthop;
+	in_addr_t genmask;
+	in_addr_t gateway;
 	uint32_t metric;
 	uint32_t type;
 	uint32_t flags;
