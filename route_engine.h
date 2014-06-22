@@ -5,13 +5,14 @@
 
 typedef struct interface {
 	char ifname[IFNAMSIZ];
-	uint8_t ifnumber;
-	uint8_t active;         
+	uint8_t ifnumber;   
 	in_addr_t network;//network id
 	in_addr_t mask;//netmask
 	in_addr_t ip;//ip address
 	in_addr_t broadcast;//broadcast address
-	int sock_fd;//socket file descriptor assosiated with current network interface
+	//socket file descriptors assosiated with current network interface
+	int send_fd;
+	int recv_fd;
 	struct interface * next;
 
 } interface;
@@ -53,5 +54,5 @@ typedef struct route_entry {
 	uint32_t flags;
 	time_t expire_timer;
 	time_t holddown_timer;
-	route_entry *next;
+	struct route_entry *next;
 } route_entry;
