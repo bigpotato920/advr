@@ -18,6 +18,11 @@ typedef struct interface {
 
 } interface;
 
+typedef struct if_list {
+	int length;
+	interface *head;
+} interface_list;
+
 //RIP2 entry
 typedef struct rte {
 	uint8_t family;
@@ -57,3 +62,8 @@ typedef struct route_entry {
 	time_t holddown_timer;
 	struct route_entry *next;
 } route_entry;
+
+typedef struct route_entry_list {
+	int length;
+	route_entry *head;
+} route_entry_list;

@@ -36,14 +36,18 @@
 //return the rip_entry num contained in the rip packet
 #define get_rte_num(packet) ((sizeof(packet) - sizeof(rip_packet)) / sizeof(rte))
 
+int init_system();
 int init_ifs(const char **active_ifs, int n);
+void start_route_service();
 int add_local_rtes();
 int get_if_info(interface *cif);
 void get_broadcast(interface * cif);
 int set_if_fds(interface *cif);
+int send_rip_packet();
+rip_packet *prepare_rip_packet();
 
-interface *if_list = NULL;
-route_entry *rte_list = NULL;
+interface_list *if_list;
+route_entry_list *rte_list;
 
 int ip_to_str(in_addr_t ip, char *str)
 {
@@ -87,6 +91,31 @@ void print_rte(route_entry *rte)
 }
 
 /**
+ * init interface list and route entry list
+ * @return 0 on success or -1 on failure
+ */
+int init_system()
+{
+	if_list = (interface_list*)malloc(sizeof(interface_list));
+	if (if_list == NULL) {
+		log_err("Failed to create interface list");
+		return -1;
+	}
+	if_list->length = 0;
+	if_list->head = NULL;
+
+	rte_list = (route_entry_list*)malloc(sizeof(route_entry_list));
+	if (rte_list == NULL) {
+		log_err("Failed to create route entry list");
+		return -1;
+	}
+	rte_list->length = 0;
+	rte_list->head = NULL;
+
+	return 0;
+}
+
+/**
  * insert all the valid active network interfaces to the interface list
  * @param if_list head of the interface list
  * @param active_ifs name of the active network interface
@@ -98,6 +127,7 @@ int init_ifs(const char **active_ifs, int n)
 	char ifname[IFNAMSIZ];
 	interface *cur_if = NULL;
     int i;
+
 
 
 	for (ifindex = 1; if_indextoname(ifindex, ifname) != 0; ifindex++) {
@@ -124,18 +154,19 @@ int init_ifs(const char **active_ifs, int n)
 			}
 		}
 		//insert the current interface to the head of the list
-		if (if_list == NULL) {
+		if (if_list->head == NULL) {
 
-			if_list = cur_if;
+			if_list->head = cur_if;
 			cur_if->next = NULL;
 
 		} else {
-			cur_if->next = if_list;
-			if_list = cur_if;
+			cur_if->next = if_list->head;
+			if_list->head = cur_if;
 		}
+		if_list->length++;
 	}
 
-	cur_if = if_list;
+	cur_if = if_list->head;
 	while (cur_if != NULL) {
 		print_if(cur_if);
 		cur_if = cur_if->next;
@@ -272,7 +303,7 @@ int set_if_fds(interface *cif)
  */
 int add_local_rtes()
 {
-	interface *cur_if = if_list;
+	interface *cur_if = if_list->head;
 	route_entry *cur_rte = NULL;
 	assert(cur_if != NULL);
 
@@ -291,26 +322,38 @@ int add_local_rtes()
 		cur_rte->expire_timer = NOTUSED_TIMER;
 		cur_rte->holddown_timer = NOTUSED_TIMER;
 
-		if (rte_list == NULL) {
+		if (rte_list->head == NULL) {
 			cur_rte->next = NULL;
-			rte_list = cur_rte;
+			rte_list->head = cur_rte;
 		} else {
-			cur_rte->next = rte_list;
-			rte_list = cur_rte;
+			cur_rte->next = rte_list->head;
+			rte_list->head = cur_rte;
 		}
 		cur_if = cur_if->next;
+		rte_list->length++;
 	}
 
-	cur_rte = rte_list;
+	cur_rte = rte_list->head;
+    //just for debugging
 	while (cur_rte) {
 		print_rte(cur_rte);
 		cur_rte = cur_rte->next;
 	}
 	return 0;
 }
-int start_route_service(interface *if_list)
+
+rip_packet *prepare_rip_packet()
 {
-	interface *cur_if = if_list;
+
+}
+int send_rip_packet()
+{
+
+}
+
+void start_route_service()
+{
+	interface *cur_if = if_list->head;
 
 	struct epoll_event event;
 	struct epoll_event *events;
@@ -319,12 +362,12 @@ int start_route_service(interface *if_list)
 
 	if ((efd = epoll_create(1)) == -1) {
 		log_err("Failed to create epoll fd");
-		return -1;
+		return;
 	}
 	events = (struct epoll_event*)calloc(MAX_EPOLL_EVENTS, sizeof(event));
 	if (events == NULL) {
 		log_err("Failed to create events");
-		return -1;
+		return;
 	}
 	while (cur_if) {
 		event.data.fd = cur_if->recv_fd;
@@ -332,7 +375,7 @@ int start_route_service(interface *if_list)
 		res = epoll_ctl(efd, EPOLL_CTL_ADD, cur_if->recv_fd, &event);
 		if (res == -1) {
 			log_err("Failed to add event to epoll queue");
-			return -1;
+			return;
 		}
 		cur_if = cur_if->next;
 	}
@@ -341,7 +384,12 @@ int start_route_service(interface *if_list)
 		int n, i;
 		n = epoll_wait(efd, events, MAX_EPOLL_EVENTS, SECOND_TO_MILLSECOND(UPDATE_INTERVAL) );
 		if (n == 0) {
-			log_info("Timeout");  
+			log_info("Timeout");
+			//1. send route update message
+			
+			//2. update expire_timer and holddown_timer in route_entry, 
+			//remove the expired route_entry to holddown list, delete 
+			//holddown entry when its timer is to zero
 		}
 		for (i = 0; i < n; i++) {
 			if ((events[i].events & EPOLLERR) ||
@@ -379,7 +427,11 @@ int main(int argc, char const *argv[])
 
 	int res;
 
-
+	res = init_system();
+	if (res == -1) {
+		log_err("Failed to initialize system variables");
+		exit(EXIT_FAILURE);
+	}
 	res = init_ifs(active_ifs, 3);
 	if (res == -1) {
 		log_err("Failed to initialize all the interfaces");
@@ -390,6 +442,6 @@ int main(int argc, char const *argv[])
 		log_err("Failed to add local route entries");
 		exit(EXIT_FAILURE);
 	}
-	start_route_service(if_list);
+	start_route_service();
 	return 0;
 }
