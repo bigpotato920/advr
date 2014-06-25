@@ -11,11 +11,11 @@
 #include <assert.h>
 #include <sys/socket.h>
 #include <sys/types.h>
-
+#include <time.h>
 #include "log.h"
 #include "route_engine.h"
 
-#define UPDATE_INTERVAL 5
+#define UPDATE_INTERVAL 15
 #define EXPIRE_INTERVAL 180
 #define HODLDOWN_INTERVAL 120
 #define RIP_RESPONSE 0
@@ -36,7 +36,7 @@
 #define NOTUSED_TIMER -1
 
 #define IP_STR_LEN 16
-#define SECOND_TO_MILLSECOND(second) (second * 1000)
+#define SECOND_TO_MILLSECOND(second) ((second) * 1000)
 //a rip packet can contine 1 to 25(inclusize)rip route entry
 #define MAX_RIP_PACKET_SIZE (sizeof(rip_packet) + MAX_RTE_NUM * sizeof(rte))
 //return the rip_entry num contained in the rip packet
@@ -499,12 +499,14 @@ void start_route_service()
 		}
 		cur_if = cur_if->next;
 	}
-
+	int timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL);
 	while (1) {
 		int n, i;
-		n = epoll_wait(efd, events, MAX_EPOLL_EVENTS, SECOND_TO_MILLSECOND(UPDATE_INTERVAL));
-		if (n == 0) {
+		time_t init_time = time(NULL);
 
+		n = epoll_wait(efd, events, MAX_EPOLL_EVENTS, timeout);
+		if (n == 0) {
+			timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL);
 			log_info("Timeout");
 			//1. send route    update message
 			rip_packet *rp = NULL;
@@ -546,6 +548,8 @@ void start_route_service()
 					print_rip_packet((rip_packet*)&buffer, rte_num);
 				}	
 			}
+			timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL-(time(NULL) - init_time));
+			log_err("timeout = %d", timeout);
 		}
 
 	}
