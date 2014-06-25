@@ -1,3 +1,6 @@
+#ifndef ROUTE_ENGINE_H
+#define ROUTE_ENGINE_H
+
 #include <sys/types.h>
 #include <net/if.h>
 #include <stdint.h>
@@ -24,6 +27,7 @@ typedef struct if_list {
 } interface_list;
 
 //RIP2 entry
+#pragma pack(push, 1)
 typedef struct rte {
 	uint8_t family;
 	uint8_t tag;
@@ -42,6 +46,7 @@ typedef struct rip_packet {
 	rte routes[0];
 } rip_packet;
 
+#pragma pack(pop)
 //User space route entry
 //The expire timer is initialized when a route is established, and any time
 //an update message is received for the route.If 180 seconds elapse
@@ -63,7 +68,9 @@ typedef struct route_entry {
 	struct route_entry *next;
 } route_entry;
 
+
 typedef struct route_entry_list {
 	int length;
 	route_entry *head;
 } route_entry_list;
+#endif
