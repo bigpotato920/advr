@@ -549,7 +549,7 @@ void start_route_service()
 				}	
 			}
 			timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL-(time(NULL) - init_time));
-			log_err("timeout = %d", timeout);
+			debug("timeout = %d", timeout);
 		}
 
 	}
