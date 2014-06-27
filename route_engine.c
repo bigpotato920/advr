@@ -15,9 +15,9 @@
 #include "log.h"
 #include "route_engine.h"
 
-#define UPDATE_INTERVAL 15
-#define EXPIRE_INTERVAL 180
-#define HODLDOWN_INTERVAL 120
+#define UPDATE_INTERVAL 5
+#define EXPIRE_INTERVAL 20
+#define HODLDOWN_INTERVAL 10
 #define RIP_RESPONSE 0
 #define RIP_REQUEST 1
 #define RIP_VERSION 2
@@ -32,7 +32,7 @@
 #define NON_LOCAL_ROUTE_ENTRY 1
 #define VALID_ROUTE_ENTRY 0
 #define INVALID_ROUTE_ENTRY 1
-#define MAX_METRIC_COUNT 15
+#define INFINITY 16
 #define NOTUSED_TIMER -1
 
 #define IP_STR_LEN 16
@@ -56,6 +56,22 @@ rip_packet *prepare_rip_packet();
 
 interface_list *if_list;
 route_entry_list *re_list;
+
+/**
+ * Judge whether the ip is a local interface bounded ip
+ * @param  ip ip address in network order
+ * @return    1 on yes or 0 on no
+ */
+int is_local_ip(in_addr_t ip)
+{
+	interface *cif = if_list->head;
+	while (cif) {
+		if (ip == cif->ip)
+			return 1;
+		cif = cif->next;
+	}
+	return 0;
+}
 
 int ip_to_str(in_addr_t ip, char *str)
 {
@@ -384,6 +400,104 @@ int add_local_rtes()
 }
 
 /**
+ * Judge whether the rte in the rip packet is suitable to insert into the 
+ * route entry list and kernel route entry list.
+ * Two standards:
+ * 1. destination never appert in the route entry list
+ * 2. if metric is less than the entry in the route entry list
+ * @param  r rip route entry in the rip packet
+ * @return   1 on better or 0 on worth
+ */
+int is_better_rte(rte *r)
+{
+	route_entry *re = re_list->head;
+	int has_entry = 0;
+	while (re) {
+		if (r->ip == re->dst)
+			has_entry = 1;
+		if (has_entry && r->metric + 1< re->metric)
+			return 1;   
+		re = re->next;
+	}
+	if (has_entry)
+		return 0;
+	return 1;
+}
+
+/**
+ * insert the better rte in the rip packet into the route entry lists
+ * invoke after is_better_rte() to make sure it's a better path
+ * @param  r the bettoer rte
+ * @return   0 on success or -1 on failure
+ */
+int re_list_insert(rte *r, in_addr_t sender_ip)
+{
+	route_entry *re = re_list->head;
+	while (re) {
+		if (re->dst == r->ip) {
+			re->metric = r->metric + 1;
+			re->expire_timer = EXPIRE_INTERVAL;
+			re->holddown_timer = HODLDOWN_INTERVAL;
+			break;
+		}
+		re = re->next;
+	}
+
+	route_entry *new_re = (route_entry*)malloc(sizeof(route_entry));
+	if (new_re == NULL) {
+		log_err("Failed to create route entry");
+		return -1;
+	}
+	new_re->dst = r->ip;
+	new_re->gateway = sender_ip;
+	new_re->genmask = r->mask;
+	new_re->metric = r->metric + 1;
+	new_re->flags = VALID_ROUTE_ENTRY;
+	new_re->type = NON_LOCAL_ROUTE_ENTRY;
+	new_re->expire_timer = EXPIRE_INTERVAL;
+	new_re->holddown_timer = HODLDOWN_INTERVAL;
+	
+	new_re->next = re_list->head;
+	re_list->head = new_re;
+	re_list->length++;
+	
+	log_info("new route entry inserted");
+	print_route_entry(new_re);
+
+	return 0;
+}
+
+/**
+ * delete the expired route entry from the route entry list
+ * when expire_timer and holddown timer both expired
+ * @param  re route entry to be deleted
+ * @return    0 on success or -1 on failure
+ */
+int re_list_delete(route_entry *re)
+{
+	route_entry *cur_re = re_list->head;
+	route_entry *prev_re = NULL;
+	assert(re != NULL);
+	while (cur_re) {
+		if (cur_re == re) {
+			if (prev_re == NULL) {
+				re_list->head = cur_re->next;
+			} else {
+				prev_re->next = cur_re->next;
+			}
+
+			free(re);
+			re_list->length--;
+			break;
+		}
+		prev_re = cur_re;
+		cur_re = cur_re->next;
+	}
+
+	return 0;
+}
+
+/**
  *prepare a rip packet to send
  *@rp specific rip packet
  *@return return the size of the rip packet
@@ -428,6 +542,26 @@ rip_packet *prepare_rip_packet()
     return rp;
 }
 
+/**
+ * walk through the rtes in the rip packet
+ * judge whether each rte is worth to insert into the route entry list
+ * @param rte_num rte count in the rip packet
+ */
+void parse_rip_packet(rip_packet *rp, int rte_num, in_addr_t sender_ip) 
+{
+	debug("enter parse_rip_packet");
+	rte *r = (rte*)((char*)rp + sizeof(rip_packet));
+	int i;
+	for (i = 0; i < rte_num; i++) {
+		if (is_better_rte(r)) {
+			log_info("Receive a better rte");
+			print_rte(r);
+			re_list_insert(r, sender_ip);
+		}
+		r++;
+	}
+	debug("leave parse_rip_packet");
+}
 /**
  * send rip packet through specific interface
  * @param  cif  current network interface
@@ -518,8 +652,31 @@ void start_route_service()
 			//2. update expire_timer and holddown_timer in route_entry, 
 			//remove the expired route_entry to holddown list, delete 
 			//holddown entry when its timer is to zero
+			route_entry *re = re_list->head;
+			while (re) {
+				//LOCAL ROUTE ENTRY will never expire
+				if (re->type != LOCAL_ROUTE_ENTRY) {
+					if (re->flags == VALID_ROUTE_ENTRY) {
+						re->expire_timer -= UPDATE_INTERVAL;
+
+						if (re->expire_timer <= 0) {
+							re->flags = INVALID_ROUTE_ENTRY;
+							re->metric = INFINITY;
+						}
+					} else {
+						re->holddown_timer -= UPDATE_INTERVAL;
+						if (re->holddown_timer <= 0) {
+							log_info("Begin to delete route from route entry list");
+							print_route_entry(re);
+							re_list_delete(re);
+						}
+					}
+					
+				}
+				re = re->next;
+			}
 		} else {
-			log_info("Receive rip update messages");
+			
 			for (i = 0; i < n; i++) {
 				if ((events[i].events & EPOLLERR) ||
 					(events[i].events & EPOLLHUP) ||
@@ -531,25 +688,33 @@ void start_route_service()
 				} else {
                     char buffer[MAX_RIP_PACKET_SIZE];
 					int fd = events[i].data.fd;
+					struct sockaddr_in sender_addr;
+					socklen_t sender_len;
 					int nread;
 					int rte_num;
 
+					sender_len = sizeof(sender_addr);
                     memset(&buffer, 0, MAX_RIP_PACKET_SIZE);
-					nread = read(fd, &buffer, MAX_RIP_PACKET_SIZE);
+					//nread = read(fd, &buffer, MAX_RIP_PACKET_SIZE);
+					nread = recvfrom(fd, &buffer, MAX_RIP_PACKET_SIZE, 0, (struct sockaddr *)&sender_addr, &sender_len);
 					if (nread < 0) {
 						log_err("Failed to read rip packet from fd:%d", fd);
 						close(fd);
 						continue;
 					}
+					//ignore the broadcast packets send by itself
+					if (!is_local_ip(sender_addr.sin_addr.s_addr)) {
+						log_info("Receive rip update messages");
+						rte_num = get_rte_num(nread);
+						assert(rte_num > 0);
+						log_info("Receive a route update message from fd:%d,which contain %d route entr%s", fd, rte_num, (rte_num == 1) ? "y\b": "ies");
+						print_rip_packet((rip_packet*)&buffer, rte_num);
+						parse_rip_packet((rip_packet*)&buffer, rte_num, sender_addr.sin_addr.s_addr);
+					}
 
-					rte_num = get_rte_num(nread);
-					assert(rte_num > 0);
-					log_info("Receive a route update message from fd:%d,which contain %d route entr%s", fd, rte_num, (rte_num == 1) ? "y\b": "ies");
-					print_rip_packet((rip_packet*)&buffer, rte_num);
 				}	
 			}
 			timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL-(time(NULL) - init_time));
-			debug("timeout = %d", timeout);
 		}
 
 	}
