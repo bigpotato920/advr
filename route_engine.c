@@ -41,7 +41,7 @@
 #define MAX_RIP_PACKET_SIZE (sizeof(rip_packet) + MAX_RTE_NUM * sizeof(rte))
 //return the rip_entry num contained in the rip packet
 #define get_rte_num(packet_size)((packet_size - sizeof(rip_packet)) / sizeof(rte)) 
-#define get_rip_packet_size() (sizeof(rip_packet) + re_list->length * sizeof(rte))
+#define get_rip_packet_size(rte_num) (sizeof(rip_packet) + rte_num * sizeof(rte))
 
 //utility function
 int is_local_ip(in_addr_t ip);
@@ -62,8 +62,8 @@ void get_broadcast(interface * cif);
 int set_if_fds(interface *cif);
 int sendto_if(interface *cif, rip_packet *rp, int size);
 void broadcast_update_msg();
-void send_rip_packet(rip_packet *rp);
-rip_packet *prepare_rip_packet();
+void send_rip_packet(rip_packet *rp, int rte_num, interface *cif);
+rip_packet *prepare_rip_packet(interface *cif, int *rte_num);
 int process_upcoming_msg(int fd);
 void maintain_route_list();
 void parse_rip_packet(rip_packet *rp, int rte_num, in_addr_t sender_ip);
@@ -397,6 +397,7 @@ int add_local_rtes()
 		cur_rte->flags = VALID_ROUTE_ENTRY;
 		cur_rte->expire_timer = NOTUSED_TIMER;
 		cur_rte->holddown_timer = NOTUSED_TIMER;
+		cur_rte->recvif = NULL;
 
 		if (re_list->head == NULL) {
 			cur_rte->next = NULL;
@@ -517,18 +518,39 @@ int re_list_delete(route_entry *re)
 }
 
 /**
- *prepare a rip packet to send
- *@rp specific rip packet
- *@return return the size of the rip packet
+ * count how many route entry should send through specific interface
+ * @param  cif which interface to send to
+ * @return     num of route entry
  */
-rip_packet *prepare_rip_packet()
+int count_re4if(interface *cif)
 {
-	int rte_num = re_list->length;
 	route_entry *re = re_list->head;
+	int cnt = 0;
+	while (re) {
+		if (re->recvif != cif)
+			cnt++;
+		re = re->next;
+	}
+
+	return cnt;
+}
+
+/**
+ *prepare a rip packet send to specific interface
+ *@parama cif interface to send to
+ *@param rte_num get the rip route entry number
+ *@return rip packet construct for specific interface
+ */
+rip_packet *prepare_rip_packet(interface *cif, int *rte_num)
+{
+	
+	route_entry *re = re_list->head;
+
 	rte *cur_r = NULL;
     rip_packet *rp = NULL;
 
-    int rip_packet_size = sizeof(rip_packet) + rte_num * sizeof(rte);
+    *rte_num = count_re4if(cif);
+    int rip_packet_size = sizeof(rip_packet) + (*rte_num) * sizeof(rte);
     rp = (rip_packet*)malloc(rip_packet_size);
     if (rp == NULL) {
         log_err("Failed to create rip packet");
@@ -602,10 +624,9 @@ int sendto_if(interface *cif, rip_packet *rp, int size)
 	return nwrite;
 }
 
-void send_rip_packet(rip_packet *rp) 
+void send_rip_packet(rip_packet *rp, int rte_num, interface *cif) 
 {
-	interface *cif = if_list->head;
-    int size = get_rip_packet_size();
+    int size = get_rip_packet_size(rte_num);
 	int res;
     
 	for (; cif != NULL; cif = cif->next) {
@@ -625,11 +646,17 @@ void send_rip_packet(rip_packet *rp)
 void broadcast_update_msg()
 {
 	rip_packet *rp = NULL;
-	rp = prepare_rip_packet();
-    assert(rp != NULL);
+	interface *cif = if_list->head;
+    int rte_num = 0;
 
-	send_rip_packet(rp);
-    free(rp);
+	for (; cif != NULL; cif = cif->next) {
+		if (cif->active) {
+			rp = prepare_rip_packet(cif, &rte_num);
+			assert(rp != NULL);
+			send_rip_packet(rp, rte_num, cif);
+			free(rp);
+		}
+	}
 }
 
 /**
@@ -703,6 +730,7 @@ void maintain_route_list()
 /**
  * add various events to epoll
  * @param efd epool fd
+ * @TODO add interface to the event.data.ptr,so we can get more information when socket is ready
  */
 void epoll_add_events(int efd)
 {
@@ -754,14 +782,14 @@ void start_route_service()
 		if (n == 0) {
 			timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL);
 			log_info("Timeout");
-			//1. send route    update message
+			//1. send route update message
 			broadcast_update_msg();
 			//2. update expire_timer and holddown_timer in route_entry, 
 			//remove the expired route_entry to holddown list, delete 
 			//holddown entry when its timer is to zero
 			maintain_route_list();
 		} else {
-			
+			//read route update message from specific sock fd
 			for (i = 0; i < n; i++) {
 				if ((events[i].events & EPOLLERR) ||
 					(events[i].events & EPOLLHUP) ||
@@ -769,7 +797,7 @@ void start_route_service()
 					log_err("An error has occured on fd:%d", events[i].data.fd);
 					close(events[i].data.fd);
 					continue;
-				//read route update message from specific sock fd
+				
 				} else {
 					process_upcoming_msg(events[i].data.fd);
 				}	

@@ -67,7 +67,7 @@ typedef struct route_entry {
 	time_t holddown_timer;
 	//on which interface the route entry come from
 	//which will help to implement split horizon
-	interface *rif;
+	interface *recvif;
 	struct route_entry *next;
 } route_entry;
 
