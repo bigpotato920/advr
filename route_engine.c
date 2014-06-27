@@ -64,11 +64,11 @@ int sendto_if(interface *cif, rip_packet *rp, int size);
 void broadcast_update_msg();
 void send_rip_packet(rip_packet *rp, int rte_num, interface *cif);
 rip_packet *prepare_rip_packet(interface *cif, int *rte_num);
-int process_upcoming_msg(int fd);
+int process_upcoming_msg(void *data);
 void maintain_route_list();
-void parse_rip_packet(rip_packet *rp, int rte_num, in_addr_t sender_ip);
+void parse_rip_packet(rip_packet *rp, int rte_num, interface *recvif, in_addr_t sender_ip);
 int is_better_rte(rte *r);
-int re_list_insert(rte *r, in_addr_t sender_ip);
+int re_list_insert(rte *r, interface *recvif, in_addr_t sender_ip);
 int re_list_delete(route_entry *re);
 void start_route_service();
 
@@ -450,7 +450,7 @@ int is_better_rte(rte *r)
  * @param  r the bettoer rte
  * @return   0 on success or -1 on failure
  */
-int re_list_insert(rte *r, in_addr_t sender_ip)
+int re_list_insert(rte *r, interface *recvif, in_addr_t sender_ip)
 {
 	route_entry *re = re_list->head;
 	while (re) {
@@ -458,6 +458,7 @@ int re_list_insert(rte *r, in_addr_t sender_ip)
 			re->metric = r->metric + 1;
 			re->expire_timer = EXPIRE_INTERVAL;
 			re->holddown_timer = HODLDOWN_INTERVAL;
+			re->recvif = recvif;
 			break;
 		}
 		re = re->next;
@@ -476,7 +477,8 @@ int re_list_insert(rte *r, in_addr_t sender_ip)
 	new_re->type = NON_LOCAL_ROUTE_ENTRY;
 	new_re->expire_timer = EXPIRE_INTERVAL;
 	new_re->holddown_timer = HODLDOWN_INTERVAL;
-	
+	new_re->recvif = recvif;
+
 	new_re->next = re_list->head;
 	re_list->head = new_re;
 	re_list->length++;
@@ -535,74 +537,7 @@ int count_re4if(interface *cif)
 	return cnt;
 }
 
-/**
- *prepare a rip packet send to specific interface
- *@parama cif interface to send to
- *@param rte_num get the rip route entry number
- *@return rip packet construct for specific interface
- */
-rip_packet *prepare_rip_packet(interface *cif, int *rte_num)
-{
-	
-	route_entry *re = re_list->head;
 
-	rte *cur_r = NULL;
-    rip_packet *rp = NULL;
-
-    *rte_num = count_re4if(cif);
-    int rip_packet_size = sizeof(rip_packet) + (*rte_num) * sizeof(rte);
-    rp = (rip_packet*)malloc(rip_packet_size);
-    if (rp == NULL) {
-        log_err("Failed to create rip packet");
-        return NULL;
-    }
-    memset(rp, 0, rip_packet_size);
-    rp->command = RIP_RESPONSE;
-    rp->version = RIP_VERSION;
-    rp->pad1 = 0;
-    rp->pad2 = 0;
-    //not forget to cast rp to char* or the pointer will 
-    //forward sizeof(rip_packet) * sizeof(rip_packet)
-    //not just sizeof(rip_packet)
-	cur_r = (rte*)((char*)rp + sizeof(rip_packet));
-
-	while (re) {
-
-		cur_r->family = 0;
-		cur_r->tag = 0;
-		cur_r->ip = re->dst;
-
-		cur_r->mask = re->genmask;
-		cur_r->nexthop = re->gateway;
-		cur_r->metric = re->metric;
-		print_rte(cur_r);
-		re = re->next;
-		cur_r++;
-	}
-
-    return rp;
-}
-
-/**
- * walk through the rtes in the rip packet
- * judge whether each rte is worth to insert into the route entry list
- * @param rte_num rte count in the rip packet
- */
-void parse_rip_packet(rip_packet *rp, int rte_num, in_addr_t sender_ip) 
-{
-	debug("enter parse_rip_packet");
-	rte *r = (rte*)((char*)rp + sizeof(rip_packet));
-	int i;
-	for (i = 0; i < rte_num; i++) {
-		if (is_better_rte(r)) {
-			log_info("Receive a better rte");
-			print_rte(r);
-			re_list_insert(r, sender_ip);
-		}
-		r++;
-	}
-	debug("leave parse_rip_packet");
-}
 /**
  * send rip packet through specific interface
  * @param  cif  current network interface
@@ -624,21 +559,98 @@ int sendto_if(interface *cif, rip_packet *rp, int size)
 	return nwrite;
 }
 
+/**
+ *prepare a rip packet send to specific interface
+ *@parama cif interface to send to
+ *@param rte_num get the rip route entry number
+ *@return rip packet construct for specific interface
+ */
+rip_packet *prepare_rip_packet(interface *cif, int *rte_num)
+{
+	
+	route_entry *re = re_list->head;
+	rte *cur_r = NULL;
+    rip_packet *rp = NULL;
+
+    *rte_num = count_re4if(cif);
+    debug("rte_num = %d", *rte_num);
+    int rip_packet_size = sizeof(rip_packet) + (*rte_num) * sizeof(rte);
+    debug("rip packet size = %d", rip_packet_size);
+    rp = (rip_packet*)malloc(rip_packet_size);
+    if (rp == NULL) {
+        log_err("Failed to create rip packet");
+        return NULL;
+    }
+    memset(rp, 0, rip_packet_size);
+    rp->command = RIP_RESPONSE;
+    rp->version = RIP_VERSION;
+    rp->pad1 = 0;
+    rp->pad2 = 0;
+    //not forget to cast rp to char* or the pointer will 
+    //forward sizeof(rip_packet) * sizeof(rip_packet)
+    //not just sizeof(rip_packet)
+	cur_r = (rte*)((char*)rp + sizeof(rip_packet));
+
+	while (re) {
+		//don't include the route entry receive from interface cif
+		if (re->recvif != cif) {
+			cur_r->family = 0;
+			cur_r->tag = 0;
+			cur_r->ip = re->dst;
+
+			cur_r->mask = re->genmask;
+			cur_r->nexthop = re->gateway;
+			cur_r->metric = re->metric;
+			print_rte(cur_r);
+			cur_r++;
+		}
+
+		re = re->next;
+		
+	}
+
+    return rp;
+}
+
+/**
+ * send rip packet through specific network interface
+ * @param rp      rip packet
+ * @param rte_num rte num in the packet
+ * @param cif     network interface name
+ */
 void send_rip_packet(rip_packet *rp, int rte_num, interface *cif) 
 {
     int size = get_rip_packet_size(rte_num);
 	int res;
     
-	for (; cif != NULL; cif = cif->next) {
-		if (cif->active) {
-			res = sendto_if(cif, rp, size);
-			if (res == -1) {
-				log_err("Failed send rip packet through interface:%s", cif->ifname);
-				continue;
-			}
-		}
-	}
+    res = sendto_if(cif, rp, size);
+    if (res == -1) {
+    	log_err("Failed send rip packet through interface:%s", cif->ifname);
+    }
+    return;
 }
+
+/**
+ * walk through the rtes in the rip packet
+ * judge whether each rte is worth to insert into the route entry list
+ * @param rte_num rte count in the rip packet
+ */
+void parse_rip_packet(rip_packet *rp, int rte_num, interface* recvif, in_addr_t sender_ip) 
+{
+	debug("enter parse_rip_packet");
+	rte *r = (rte*)((char*)rp + sizeof(rip_packet));
+	int i;
+	for (i = 0; i < rte_num; i++) {
+		if (is_better_rte(r)) {
+			log_info("Receive a better rte");
+			print_rte(r);
+			re_list_insert(r, recvif, sender_ip);
+		}
+		r++;
+	}
+	debug("leave parse_rip_packet");
+}
+
 
 /**
  * broad cast route entry update message
@@ -664,8 +676,9 @@ void broadcast_update_msg()
  * @param  fd socket descriptor bound to specific interface
  * @return    0 on success or -1 on failure
  */
-int process_upcoming_msg(int fd)
+int process_upcoming_msg(void *data)
 {
+	interface *cif = (interface*)data;
     char buffer[MAX_RIP_PACKET_SIZE];
 	struct sockaddr_in sender_addr;
 	socklen_t sender_len;
@@ -675,10 +688,10 @@ int process_upcoming_msg(int fd)
 	sender_len = sizeof(sender_addr);
     memset(&buffer, 0, MAX_RIP_PACKET_SIZE);
 
-	nread = recvfrom(fd, &buffer, MAX_RIP_PACKET_SIZE, 0, (struct sockaddr *)&sender_addr, &sender_len);
+	nread = recvfrom(cif->recv_fd, &buffer, MAX_RIP_PACKET_SIZE, 0, (struct sockaddr *)&sender_addr, &sender_len);
 	if (nread < 0) {
-		log_err("Failed to read rip packet from fd:%d", fd);
-		close(fd);
+		log_err("Failed to read rip packet from fd:%d", cif->recv_fd);
+		close(cif->recv_fd);
 		return -1;
 	}
 	//ignore the broadcast packets send by itself
@@ -686,9 +699,10 @@ int process_upcoming_msg(int fd)
 		log_info("Receive rip update messages");
 		rte_num = get_rte_num(nread);
 		assert(rte_num > 0);
-		log_info("Receive a route update message from fd:%d,which contain %d route entr%s", fd, rte_num, (rte_num == 1) ? "y\b": "ies");
+		debug("nread = %d", nread);
+		log_info("Receive a route update message from fd:%d,which contain %d route entr%s", cif->recv_fd, rte_num, (rte_num == 1) ? "y\b": "ies");
 		print_rip_packet((rip_packet*)&buffer, rte_num);
-		parse_rip_packet((rip_packet*)&buffer, rte_num, sender_addr.sin_addr.s_addr);
+		parse_rip_packet((rip_packet*)&buffer, rte_num, cif, sender_addr.sin_addr.s_addr);
 	}
 
 	return 0;
@@ -742,7 +756,8 @@ void epoll_add_events(int efd)
 	while (cur_if) {
 		if (cur_if->active) {
 			log_info("Add interface:%s's recv_fd:%d to epoll", cur_if->ifname, cur_if->recv_fd);
-			event.data.fd = cur_if->recv_fd;
+			//event.data.fd = cur_if->recv_fd;
+			event.data.ptr = cur_if;
 			event.events = EPOLLIN | EPOLLET;
 			res = epoll_ctl(efd, EPOLL_CTL_ADD, cur_if->recv_fd, &event);
 			if (res == -1) {
@@ -799,7 +814,7 @@ void start_route_service()
 					continue;
 				
 				} else {
-					process_upcoming_msg(events[i].data.fd);
+					process_upcoming_msg(events[i].data.ptr);
 				}	
 			}
 			timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL-(time(NULL) - init_time));
