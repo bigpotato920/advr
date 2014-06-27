@@ -43,16 +43,34 @@
 #define get_rte_num(packet_size)((packet_size - sizeof(rip_packet)) / sizeof(rte)) 
 #define get_rip_packet_size() (sizeof(rip_packet) + re_list->length * sizeof(rte))
 
+//utility function
+int is_local_ip(in_addr_t ip);
+int ip_to_str(in_addr_t ip, char *str);
+
+//debugging function
+void print_if(interface *cif);
+void print_route_entry(route_entry *rte);
+void print_rte(rte *r);
+void print_rip_packet(rip_packet *packet, int rte_num) ;
+
+
 int init_system();
 int init_ifs(const char **active_ifs, int n);
-void start_route_service();
 int add_local_rtes();
 int get_if_info(interface *cif);
 void get_broadcast(interface * cif);
 int set_if_fds(interface *cif);
 int sendto_if(interface *cif, rip_packet *rp, int size);
+void broadcast_update_msg();
 void send_rip_packet(rip_packet *rp);
 rip_packet *prepare_rip_packet();
+int process_upcoming_msg(int fd);
+void maintain_route_list();
+void parse_rip_packet(rip_packet *rp, int rte_num, in_addr_t sender_ip);
+int is_better_rte(rte *r);
+int re_list_insert(rte *r, in_addr_t sender_ip);
+int re_list_delete(route_entry *re);
+void start_route_service();
 
 interface_list *if_list;
 route_entry_list *re_list;
@@ -125,6 +143,7 @@ void print_rte(rte *r)
 
 	debug("To:%s via:%s, metric is %d", dst, gateway, r->metric);
 }
+
 void print_rip_packet(rip_packet *packet, int rte_num) 
 {
 	rte *r = (rte*)((char*)packet + sizeof(rip_packet));
@@ -600,26 +619,98 @@ void send_rip_packet(rip_packet *rp)
 	}
 }
 
-void start_route_service()
+/**
+ * broad cast route entry update message
+ */
+void broadcast_update_msg()
 {
+	rip_packet *rp = NULL;
+	rp = prepare_rip_packet();
+    assert(rp != NULL);
 
+	send_rip_packet(rp);
+    free(rp);
+}
+
+/**
+ * process update message receiving from specific interface
+ * @param  fd socket descriptor bound to specific interface
+ * @return    0 on success or -1 on failure
+ */
+int process_upcoming_msg(int fd)
+{
+    char buffer[MAX_RIP_PACKET_SIZE];
+	struct sockaddr_in sender_addr;
+	socklen_t sender_len;
+	int nread;
+	int rte_num;
+
+	sender_len = sizeof(sender_addr);
+    memset(&buffer, 0, MAX_RIP_PACKET_SIZE);
+
+	nread = recvfrom(fd, &buffer, MAX_RIP_PACKET_SIZE, 0, (struct sockaddr *)&sender_addr, &sender_len);
+	if (nread < 0) {
+		log_err("Failed to read rip packet from fd:%d", fd);
+		close(fd);
+		return -1;
+	}
+	//ignore the broadcast packets send by itself
+	if (!is_local_ip(sender_addr.sin_addr.s_addr)) {
+		log_info("Receive rip update messages");
+		rte_num = get_rte_num(nread);
+		assert(rte_num > 0);
+		log_info("Receive a route update message from fd:%d,which contain %d route entr%s", fd, rte_num, (rte_num == 1) ? "y\b": "ies");
+		print_rip_packet((rip_packet*)&buffer, rte_num);
+		parse_rip_packet((rip_packet*)&buffer, rte_num, sender_addr.sin_addr.s_addr);
+	}
+
+	return 0;
+}
+
+/**
+ * maintain the route entry list
+ * update specific timers in the route entry
+ * check whether the route entry is expired
+ * delete the expired route entry
+ */
+void maintain_route_list()
+{
+	route_entry *re = re_list->head;
+	while (re) {
+		//LOCAL ROUTE ENTRY will never expire
+		if (re->type != LOCAL_ROUTE_ENTRY) {
+			if (re->flags == VALID_ROUTE_ENTRY) {
+				re->expire_timer -= UPDATE_INTERVAL;
+
+				if (re->expire_timer <= 0) {
+					re->flags = INVALID_ROUTE_ENTRY;
+					re->metric = INFINITY;
+				}
+			} else {
+				re->holddown_timer -= UPDATE_INTERVAL;
+				if (re->holddown_timer <= 0) {
+					log_info("Begin to delete route from route entry list");
+					print_route_entry(re);
+					re_list_delete(re);
+				}
+			}
+			
+		}
+		re = re->next;
+	}
+}
+
+/**
+ * add various events to epoll
+ * @param efd epool fd
+ */
+void epoll_add_events(int efd)
+{
 	interface *cur_if = if_list->head;
 	assert(cur_if != NULL);
-
 	struct epoll_event event;
-	struct epoll_event *events;
-	int efd;
 	int res;
 
-	if ((efd = epoll_create(1)) == -1) {
-		log_err("Failed to create epoll fd");
-		return;
-	}
-	events = (struct epoll_event*)calloc(MAX_EPOLL_EVENTS, sizeof(event));
-	if (events == NULL) {
-		log_err("Failed to create events");
-		return;
-	}
 	while (cur_if) {
 		if (cur_if->active) {
 			log_info("Add interface:%s's recv_fd:%d to epoll", cur_if->ifname, cur_if->recv_fd);
@@ -633,6 +724,27 @@ void start_route_service()
 		}
 		cur_if = cur_if->next;
 	}
+}
+
+void start_route_service()
+{
+
+	struct epoll_event *events;
+	int efd;
+
+	if ((efd = epoll_create(1)) == -1) {
+		log_err("Failed to create epoll fd");
+		return;
+	}
+
+	events = (struct epoll_event*)calloc(MAX_EPOLL_EVENTS, sizeof(struct epoll_event));
+	if (events == NULL) {
+		log_err("Failed to create events");
+		return;
+	}
+	//add events we focus on
+	epoll_add_events(efd);
+
 	int timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL);
 	while (1) {
 		int n, i;
@@ -643,38 +755,11 @@ void start_route_service()
 			timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL);
 			log_info("Timeout");
 			//1. send route    update message
-			rip_packet *rp = NULL;
-			rp = prepare_rip_packet();
-            assert(rp != NULL);
-
-			send_rip_packet(rp);
-            free(rp);
+			broadcast_update_msg();
 			//2. update expire_timer and holddown_timer in route_entry, 
 			//remove the expired route_entry to holddown list, delete 
 			//holddown entry when its timer is to zero
-			route_entry *re = re_list->head;
-			while (re) {
-				//LOCAL ROUTE ENTRY will never expire
-				if (re->type != LOCAL_ROUTE_ENTRY) {
-					if (re->flags == VALID_ROUTE_ENTRY) {
-						re->expire_timer -= UPDATE_INTERVAL;
-
-						if (re->expire_timer <= 0) {
-							re->flags = INVALID_ROUTE_ENTRY;
-							re->metric = INFINITY;
-						}
-					} else {
-						re->holddown_timer -= UPDATE_INTERVAL;
-						if (re->holddown_timer <= 0) {
-							log_info("Begin to delete route from route entry list");
-							print_route_entry(re);
-							re_list_delete(re);
-						}
-					}
-					
-				}
-				re = re->next;
-			}
+			maintain_route_list();
 		} else {
 			
 			for (i = 0; i < n; i++) {
@@ -686,32 +771,7 @@ void start_route_service()
 					continue;
 				//read route update message from specific sock fd
 				} else {
-                    char buffer[MAX_RIP_PACKET_SIZE];
-					int fd = events[i].data.fd;
-					struct sockaddr_in sender_addr;
-					socklen_t sender_len;
-					int nread;
-					int rte_num;
-
-					sender_len = sizeof(sender_addr);
-                    memset(&buffer, 0, MAX_RIP_PACKET_SIZE);
-					//nread = read(fd, &buffer, MAX_RIP_PACKET_SIZE);
-					nread = recvfrom(fd, &buffer, MAX_RIP_PACKET_SIZE, 0, (struct sockaddr *)&sender_addr, &sender_len);
-					if (nread < 0) {
-						log_err("Failed to read rip packet from fd:%d", fd);
-						close(fd);
-						continue;
-					}
-					//ignore the broadcast packets send by itself
-					if (!is_local_ip(sender_addr.sin_addr.s_addr)) {
-						log_info("Receive rip update messages");
-						rte_num = get_rte_num(nread);
-						assert(rte_num > 0);
-						log_info("Receive a route update message from fd:%d,which contain %d route entr%s", fd, rte_num, (rte_num == 1) ? "y\b": "ies");
-						print_rip_packet((rip_packet*)&buffer, rte_num);
-						parse_rip_packet((rip_packet*)&buffer, rte_num, sender_addr.sin_addr.s_addr);
-					}
-
+					process_upcoming_msg(events[i].data.fd);
 				}	
 			}
 			timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL-(time(NULL) - init_time));

@@ -65,6 +65,9 @@ typedef struct route_entry {
 	uint32_t flags;
 	time_t expire_timer;
 	time_t holddown_timer;
+	//on which interface the route entry come from
+	//which will help to implement split horizon
+	interface *rif;
 	struct route_entry *next;
 } route_entry;
 
