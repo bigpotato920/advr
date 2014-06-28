@@ -51,6 +51,7 @@ int ip_to_str(in_addr_t ip, char *str);
 //debugging function
 void print_if(interface *cif);
 void print_route_entry(route_entry *rte);
+void print_re_list();
 void print_rte(rte *r);
 void print_rip_packet(rip_packet *packet, int rte_num) ;
 
@@ -67,9 +68,8 @@ void send_rip_packet(rip_packet *rp, int rte_num, interface *cif);
 rip_packet *prepare_rip_packet(interface *cif, int *rte_num);
 int process_upcoming_msg(void *data);
 void maintain_route_list();
-void parse_rip_packet(rip_packet *rp, int rte_num, interface *recvif, in_addr_t sender_ip);
-int is_better_rte(rte *r);
-int re_list_insert(rte *r, interface *recvif, in_addr_t sender_ip);
+void process_rip_packet(rip_packet *rp, int rte_num, interface *recvif, in_addr_t sender_ip);
+void process_rte(rte *r, interface *recvif, in_addr_t sender_ip);
 int re_list_delete(route_entry *re);
 void start_route_service();
 
@@ -132,6 +132,17 @@ void print_route_entry(route_entry *rte)
 	debug("dst:%s, gateway:%s, genmask:%s, metric:%d, flags:%d, type:%d, ifnumber:%d, expire_timer:%ld, holddown_timer:%ld", 
 		dst, gateway, genmask, rte->metric, rte->flags, rte->type, rte->recvif != NULL ? rte->recvif->ifnumber : -1, rte->expire_timer, rte->holddown_timer);
 }
+
+void print_re_list()
+{
+	debug("main routing table");
+	route_entry *re = re_list->head;
+	while (re) {
+		print_route_entry(re);
+		re = re->next;
+	}
+}
+
 
 //print rip route entry
 void print_rte(rte *r)
@@ -421,84 +432,21 @@ int add_local_rtes()
 }
 
 /**
- * Judge whether the rte in the rip packet is suitable to insert into the 
- * route entry list and kernel route entry list.
- * Two standards:
- * 1. destination never appert in the route entry list
- * 2. if metric is less than the entry in the route entry list
+ * Judge whether the rte in the rip packet is a route entry we have never learned
  * @param  r rip route entry in the rip packet
- * @return   1 on better or 0 on worth
+ * @return   1 0n fresh or 0 on obsolete
  */
-int is_better_rte(rte *r)
+int is_fresh_rte(rte *r)
 {
 	route_entry *re = re_list->head;
-	int has_entry = 0;
+
 	while (re) {
 		if (r->ip == re->dst)
-			has_entry = 1;
-		if (has_entry && r->metric + 1< re->metric)
-			return 1;   
+			return 0;
 		re = re->next;
 	}
-	if (has_entry)
-		return 0;
+
 	return 1;
-}
-
-/**
- * insert the better rte in the rip packet into the route entry lists
- * invoke after is_better_rte() to make sure it's a better path
- * @param  r the bettoer rte
- * @return   0 on success or -1 on failure
- */
-int re_list_insert(rte *r, interface *recvif, in_addr_t sender_ip)
-{
-	route_entry *re = re_list->head;
-	while (re) {
-		if (re->dst == r->ip) {
-			route_entry old_re;
-			memcpy(&old_re, re, sizeof(route_entry));
-			re->metric = r->metric + 1;
-			re->expire_timer = EXPIRE_INTERVAL;
-			re->holddown_timer = HODLDOWN_INTERVAL;
-			re->recvif = recvif;
-
-			kernel_route(ROUTE_MOD, &old_re, re);
-			log_info("upate a route entry");
-			debug("From:");
-			print_route_entry(&old_re);
-			debug("To:");
-			print_route_entry(re);
-
-			break;
-		}
-		re = re->next;
-	}
-
-	route_entry *new_re = (route_entry*)malloc(sizeof(route_entry));
-	if (new_re == NULL) {
-		log_err("Failed to create route entry");
-		return -1;
-	}
-	new_re->dst = r->ip;
-	new_re->gateway = sender_ip;
-	new_re->genmask = r->mask;
-	new_re->metric = r->metric + 1;
-	new_re->flags = VALID_ROUTE_ENTRY;
-	new_re->type = NON_LOCAL_ROUTE_ENTRY;
-	new_re->expire_timer = EXPIRE_INTERVAL;
-	new_re->holddown_timer = HODLDOWN_INTERVAL;
-	new_re->recvif = recvif;
-
-	new_re->next = re_list->head;
-	re_list->head = new_re;
-	re_list->length++;
-	
-	kernel_route(ROUTE_ADD, new_re, NULL);
-	log_info("new route entry inserted");
-	print_route_entry(new_re);
-
-	return 0;
 }
 
 /**
@@ -565,7 +513,7 @@ int count_re4if(interface *cif)
  */
 int sendto_if(interface *cif, rip_packet *rp, int size)
 {
-	log_info("send through interface :%s", cif->ifname);
+	
 	int nwrite;
 	struct sockaddr_in remote_server;
 	remote_server.sin_family = AF_INET;
@@ -591,9 +539,9 @@ rip_packet *prepare_rip_packet(interface *cif, int *rte_num)
     rip_packet *rp = NULL;
 
     *rte_num = count_re4if(cif);
-    debug("rte_num = %d", *rte_num);
+
+    debug("prepare rip packet rte_num = %d", *rte_num);
     int rip_packet_size = sizeof(rip_packet) + (*rte_num) * sizeof(rte);
-    debug("rip packet size = %d", rip_packet_size);
     rp = (rip_packet*)malloc(rip_packet_size);
     if (rp == NULL) {
         log_err("Failed to create rip packet");
@@ -653,22 +601,79 @@ void send_rip_packet(rip_packet *rp, int rte_num, interface *cif)
  * judge whether each rte is worth to insert into the route entry list
  * @param rte_num rte count in the rip packet
  */
-void parse_rip_packet(rip_packet *rp, int rte_num, interface* recvif, in_addr_t sender_ip) 
+void process_rip_packet(rip_packet *rp, int rte_num, interface* recvif, in_addr_t sender_ip) 
 {
-	debug("enter parse_rip_packet");
+	debug("enter process_rip_packet");
 	rte *r = (rte*)((char*)rp + sizeof(rip_packet));
 	int i;
 	for (i = 0; i < rte_num; i++) {
-		if (is_better_rte(r)) {
-			log_info("Receive a better rte");
-			print_rte(r);
-			re_list_insert(r, recvif, sender_ip);
-		}
+		process_rte(r, recvif, sender_ip);
 		r++;
 	}
-	debug("leave parse_rip_packet");
+	debug("leave process_rip_packet");
 }
 
+/**
+ * process rte resides in the rip packet
+ * @param r         rip route entry
+ * @param recvif    from which interface receive the packet
+ * @param sender_ip sender ip of the packet,which will be the gateway in the route entry 
+ */
+void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
+{
+	route_entry *re = re_list->head;
+	while (re) {
+		if (re->dst == r->ip) {
+			//better rte
+			if (re->metric > r->mask + 1) {
+				debug("better rte");
+				route_entry old_re;
+				memcpy(&old_re, re, sizeof(route_entry));
+				re->metric = r->metric + 1;
+				//re->expire_timer = EXPIRE_INTERVAL;
+				//re->holddown_timer = HODLDOWN_INTERVAL;
+				re->recvif = recvif;
+
+				kernel_route(ROUTE_MOD, &old_re, re);
+				log_info("upate a route entry");
+				debug("From:");
+				print_route_entry(&old_re);
+				debug("To:");
+				print_route_entry(re);
+			} 
+			re->flags = VALID_ROUTE_ENTRY;
+			re->expire_timer = EXPIRE_INTERVAL;
+			re->holddown_timer = HODLDOWN_INTERVAL;
+
+			return;
+		}
+		re = re->next;
+	}
+	//fresh rte
+	debug("fresh rte");
+	route_entry *new_re = (route_entry*)malloc(sizeof(route_entry));
+	if (new_re == NULL) {
+		log_err("Failed to create route entry");
+		return;
+	}
+	new_re->dst = r->ip;
+	new_re->gateway = sender_ip;
+	new_re->genmask = r->mask;
+	new_re->metric = r->metric + 1;
+	new_re->flags = VALID_ROUTE_ENTRY;
+	new_re->type = NON_LOCAL_ROUTE_ENTRY;
+	new_re->expire_timer = EXPIRE_INTERVAL;
+	new_re->holddown_timer = HODLDOWN_INTERVAL;
+	new_re->recvif = recvif;
+
+	new_re->next = re_list->head;
+	re_list->head = new_re;
+	re_list->length++;
+	
+	kernel_route(ROUTE_ADD, new_re, NULL);
+	log_info("new route entry inserted");
+	print_route_entry(new_re);
+}
 
 /**
  * broad cast route entry update message
@@ -720,7 +725,7 @@ int process_upcoming_msg(void *data)
 		debug("nread = %d", nread);
 		log_info("Receive a route update message from fd:%d,which contain %d route entr%s", cif->recv_fd, rte_num, (rte_num == 1) ? "y\b": "ies");
 		print_rip_packet((rip_packet*)&buffer, rte_num);
-		parse_rip_packet((rip_packet*)&buffer, rte_num, cif, sender_addr.sin_addr.s_addr);
+		process_rip_packet((rip_packet*)&buffer, rte_num, cif, sender_addr.sin_addr.s_addr);
 	}
 
 	return 0;
@@ -742,6 +747,7 @@ void maintain_route_list()
 				re->expire_timer -= UPDATE_INTERVAL;
 
 				if (re->expire_timer <= 0) {
+
 					route_entry old_re;
 					memcpy(&old_re, re, sizeof(route_entry));
 					re->flags = INVALID_ROUTE_ENTRY;
@@ -828,6 +834,8 @@ void start_route_service()
 			//remove the expired route_entry to holddown list, delete 
 			//holddown entry when its timer is to zero
 			maintain_route_list();
+			//3. traverse the route entry list and print each route entry
+			print_re_list();
 		} else {
 			//read route update message from specific sock fd
 			for (i = 0; i < n; i++) {
