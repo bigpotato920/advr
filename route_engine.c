@@ -67,10 +67,12 @@ void broadcast_update_msg();
 void send_rip_packet(rip_packet *rp, int rte_num, interface *cif);
 rip_packet *prepare_rip_packet(interface *cif, int *rte_num);
 int process_upcoming_msg(void *data);
-void maintain_route_list();
+void check_route_list();
 void process_rip_packet(rip_packet *rp, int rte_num, interface *recvif, in_addr_t sender_ip);
 void process_rte(rte *r, interface *recvif, in_addr_t sender_ip);
+int re_list_add(route_entry *new_re);
 int re_list_delete(route_entry *re);
+int re_list_modify(route_entry *re, route_entry *old);
 void start_route_service();
 
 interface_list *if_list;
@@ -135,7 +137,7 @@ void print_route_entry(route_entry *rte)
 
 void print_re_list()
 {
-	debug("main routing table");
+	log_info("main routing table");
 	route_entry *re = re_list->head;
 	while (re) {
 		print_route_entry(re);
@@ -432,57 +434,72 @@ int add_local_rtes()
 }
 
 /**
- * Judge whether the rte in the rip packet is a route entry we have never learned
- * @param  r rip route entry in the rip packet
- * @return   1 0n fresh or 0 on obsolete
+ * add new route entry into the route entry list
+ * @param  r rip route entry in rip packet
+ * @param  recvif on which interface receive the rip packet
+ * @param  sender_ip neighbor's ip address
+ * @return        0 on success or -1 on failure
  */
-int is_fresh_rte(rte *r)
+int re_list_add(route_entry *new_re)
 {
-	route_entry *re = re_list->head;
+	int res;
 
-	while (re) {
-		if (r->ip == re->dst)
-			return 0;
-		re = re->next;
-	}
+	new_re->next = re_list->head;
+	re_list->head = new_re;
+	re_list->length++;
+	
+	res = kernel_route(ROUTE_ADD, new_re, NULL);
+	log_info("new route entry inserted");
+	print_route_entry(new_re);
 
-	return 1;
+	return res;
 }
-
 /**
- * delete the expired route entry from the route entry list
+ * delete the expired route entry
  * when expire_timer and holddown timer both expired
  * @param  re route entry to be deleted
  * @return    0 on success or -1 on failure
  */
-int re_list_delete(route_entry *re)
+int re_list_delete(route_entry *cur_re)
 {
-	route_entry *cur_re = re_list->head;
-	route_entry *prev_re = NULL;
-	assert(re != NULL);
+
+	assert(cur_re != NULL);
 	int res;
 
-	while (cur_re) {
-		if (cur_re == re) {
-			if (prev_re == NULL) {
-				re_list->head = cur_re->next;
-			} else {
-				prev_re->next = cur_re->next;
-			}
+	res = kernel_route(ROUTE_DEL, cur_re, NULL);
+	if (cur_re->next == NULL) {
+		free(cur_re);
+		cur_re = NULL;
 
-			res = kernel_route(ROUTE_DEL, re, NULL);
-			free(re);
-			re_list->length--;
-
-			if (res != 0)
-				return -1;
-			break;
-		}
-		prev_re = cur_re;
-		cur_re = cur_re->next;
+	} else {
+		route_entry *next_re = cur_re->next;
+		memcpy(cur_re, next_re, sizeof(route_entry));
+		cur_re->next = next_re->next;
+		free(next_re);
 	}
+	re_list->length--;
 
-	return 0;
+	return res == 0 ? 0 : -1;
+}
+
+/**
+ * modify route entry
+ * @param  old_re old route entry
+ * @param  new_re new route entry
+ * @return        0 on success or -1 on failure
+ */
+int re_list_modify(route_entry *old_re, route_entry *new_re)
+{
+	int res;
+
+	log_info("upate a route entry");
+	res = kernel_route(ROUTE_MOD, old_re, new_re);
+	debug("From:");
+	print_route_entry(old_re);
+	debug("To:");
+	print_route_entry(new_re);
+
+	return res;
 }
 
 /**
@@ -623,28 +640,25 @@ void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
 {
 	route_entry *re = re_list->head;
 	while (re) {
-		if (re->dst == r->ip) {
+		if (re->dst == r->ip && re->genmask == r->mask) {
 			//better rte
 			if (re->metric > r->mask + 1) {
 				debug("better rte");
 				route_entry old_re;
 				memcpy(&old_re, re, sizeof(route_entry));
 				re->metric = r->metric + 1;
-				//re->expire_timer = EXPIRE_INTERVAL;
-				//re->holddown_timer = HODLDOWN_INTERVAL;
 				re->recvif = recvif;
+				re->gateway = sender_ip;
 
-				kernel_route(ROUTE_MOD, &old_re, re);
-				log_info("upate a route entry");
-				debug("From:");
-				print_route_entry(&old_re);
-				debug("To:");
-				print_route_entry(re);
+				re_list_modify(&old_re, re);
 			} 
-			re->flags = VALID_ROUTE_ENTRY;
-			re->expire_timer = EXPIRE_INTERVAL;
-			re->holddown_timer = HODLDOWN_INTERVAL;
-
+			//don't change local route entry
+			if (re->type == NON_LOCAL_ROUTE_ENTRY) {
+				re->flags = VALID_ROUTE_ENTRY;
+				re->expire_timer = EXPIRE_INTERVAL;
+				re->holddown_timer = HODLDOWN_INTERVAL;
+			}
+	
 			return;
 		}
 		re = re->next;
@@ -666,13 +680,7 @@ void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
 	new_re->holddown_timer = HODLDOWN_INTERVAL;
 	new_re->recvif = recvif;
 
-	new_re->next = re_list->head;
-	re_list->head = new_re;
-	re_list->length++;
-	
-	kernel_route(ROUTE_ADD, new_re, NULL);
-	log_info("new route entry inserted");
-	print_route_entry(new_re);
+	re_list_add(new_re);
 }
 
 /**
@@ -732,34 +740,35 @@ int process_upcoming_msg(void *data)
 }
 
 /**
- * maintain the route entry list
+ * check the route entry list
  * update specific timers in the route entry
  * check whether the route entry is expired
  * delete the expired route entry
  */
-void maintain_route_list()
+void check_route_list()
 {
 	route_entry *re = re_list->head;
-	while (re) {
+	while (re != NULL) {
 		//LOCAL ROUTE ENTRY will never expire
 		if (re->type != LOCAL_ROUTE_ENTRY) {
+			//decrease the expire timer
 			if (re->flags == VALID_ROUTE_ENTRY) {
 				re->expire_timer -= UPDATE_INTERVAL;
-
+				//set flag to INVALID_ROUTE_ENTRY, set matrix to INFINITY
+				//modify the kernel routing table
 				if (re->expire_timer <= 0) {
 
 					route_entry old_re;
 					memcpy(&old_re, re, sizeof(route_entry));
 					re->flags = INVALID_ROUTE_ENTRY;
 					re->metric = INFINITY;
-					kernel_route(ROUTE_MOD, &old_re, re);
-					debug("Update route from :");
-					print_route_entry(&old_re);
-					debug("To:");
-					print_route_entry(re);
+					
+					re_list_modify(&old_re, re);
 				}
+			//decrease the holddown timer
 			} else {
 				re->holddown_timer -= UPDATE_INTERVAL;
+				//remove route entry from user space and kernel space routing table
 				if (re->holddown_timer <= 0) {
 					log_info("Begin to delete route from route entry list");
 					print_route_entry(re);
@@ -768,6 +777,7 @@ void maintain_route_list()
 			}
 			
 		}
+
 		re = re->next;
 	}
 }
@@ -833,7 +843,7 @@ void start_route_service()
 			//2. update expire_timer and holddown_timer in route_entry, 
 			//remove the expired route_entry to holddown list, delete 
 			//holddown entry when its timer is to zero
-			maintain_route_list();
+			check_route_list();
 			//3. traverse the route entry list and print each route entry
 			print_re_list();
 		} else {
