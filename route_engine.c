@@ -14,6 +14,7 @@
 #include <time.h>
 #include "log.h"
 #include "route_engine.h"
+#include "kroute.h"
 
 #define UPDATE_INTERVAL 5
 #define EXPIRE_INTERVAL 20
@@ -128,8 +129,8 @@ void print_route_entry(route_entry *rte)
 	assert(ip_to_str(rte->gateway, gateway) == 0);
 	assert(ip_to_str(rte->genmask, genmask) == 0);
 
-	debug("dst:%s, gateway:%s, genmask:%s, metric:%d, flags:%d, type:%d, expire_timer:%ld, holddown_timer:%ld", 
-		dst, gateway, genmask, rte->metric, rte->flags, rte->type, rte->expire_timer, rte->holddown_timer);
+	debug("dst:%s, gateway:%s, genmask:%s, metric:%d, flags:%d, type:%d, ifnumber:%d, expire_timer:%ld, holddown_timer:%ld", 
+		dst, gateway, genmask, rte->metric, rte->flags, rte->type, rte->recvif != NULL ? rte->recvif->ifnumber : -1, rte->expire_timer, rte->holddown_timer);
 }
 
 //print rip route entry
@@ -455,10 +456,20 @@ int re_list_insert(rte *r, interface *recvif, in_addr_t sender_ip)
 	route_entry *re = re_list->head;
 	while (re) {
 		if (re->dst == r->ip) {
+			route_entry old_re;
+			memcpy(&old_re, re, sizeof(route_entry));
 			re->metric = r->metric + 1;
 			re->expire_timer = EXPIRE_INTERVAL;
 			re->holddown_timer = HODLDOWN_INTERVAL;
 			re->recvif = recvif;
+
+			kernel_route(ROUTE_MOD, &old_re, re);
+			log_info("upate a route entry");
+			debug("From:");
+			print_route_entry(&old_re);
+			debug("To:");
+			print_route_entry(re);
+
 			break;
 		}
 		re = re->next;
@@ -483,6 +494,7 @@ int re_list_insert(rte *r, interface *recvif, in_addr_t sender_ip)
 	re_list->head = new_re;
 	re_list->length++;
 	
+	kernel_route(ROUTE_ADD, new_re, NULL);
 	log_info("new route entry inserted");
 	print_route_entry(new_re);
 
@@ -500,6 +512,8 @@ int re_list_delete(route_entry *re)
 	route_entry *cur_re = re_list->head;
 	route_entry *prev_re = NULL;
 	assert(re != NULL);
+	int res;
+
 	while (cur_re) {
 		if (cur_re == re) {
 			if (prev_re == NULL) {
@@ -508,8 +522,12 @@ int re_list_delete(route_entry *re)
 				prev_re->next = cur_re->next;
 			}
 
+			res = kernel_route(ROUTE_DEL, re, NULL);
 			free(re);
 			re_list->length--;
+
+			if (res != 0)
+				return -1;
 			break;
 		}
 		prev_re = cur_re;
@@ -724,8 +742,15 @@ void maintain_route_list()
 				re->expire_timer -= UPDATE_INTERVAL;
 
 				if (re->expire_timer <= 0) {
+					route_entry old_re;
+					memcpy(&old_re, re, sizeof(route_entry));
 					re->flags = INVALID_ROUTE_ENTRY;
 					re->metric = INFINITY;
+					kernel_route(ROUTE_MOD, &old_re, re);
+					debug("Update route from :");
+					print_route_entry(&old_re);
+					debug("To:");
+					print_route_entry(re);
 				}
 			} else {
 				re->holddown_timer -= UPDATE_INTERVAL;
