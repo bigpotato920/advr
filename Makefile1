@@ -6,8 +6,7 @@ LDFLAGS=
 
 BIN_NAME = $(TARGET)
 
-#SOURCES = $(wildcard *.c)
-SOURCES = route_engine.c 
+SOURCES = $(wildcard *.c) 
 OBJECTS = $(patsubst %.c, %.o,$(SOURCES))
 
 $(TARGET) : Makefile.dependencies $(OBJECTS)
