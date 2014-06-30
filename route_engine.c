@@ -16,9 +16,9 @@
 #include "route_engine.h"
 #include "kroute.h"
 
-#define UPDATE_INTERVAL 5
-#define EXPIRE_INTERVAL 20
-#define HODLDOWN_INTERVAL 10
+#define UPDATE_INTERVAL 15
+#define EXPIRE_INTERVAL 30
+#define HODLDOWN_INTERVAL 15
 #define RIP_RESPONSE 0
 #define RIP_REQUEST 1
 #define RIP_VERSION 2
@@ -67,6 +67,7 @@ void broadcast_update_msg();
 void send_rip_packet(rip_packet *rp, int rte_num, interface *cif);
 rip_packet *prepare_rip_packet(interface *cif, int *rte_num);
 int process_upcoming_msg(void *data);
+void process_time_event();
 void check_route_list();
 void process_rip_packet(rip_packet *rp, int rte_num, interface *recvif, in_addr_t sender_ip);
 void process_rte(rte *r, interface *recvif, in_addr_t sender_ip);
@@ -77,7 +78,7 @@ void start_route_service();
 
 interface_list *if_list;
 route_entry_list *re_list;
-
+time_t update_timer = -1;
 /**
  * Judge whether the ip is a local interface bounded ip
  * @param  ip ip address in network order
@@ -132,7 +133,8 @@ void print_route_entry(route_entry *rte)
 	assert(ip_to_str(rte->genmask, genmask) == 0);
 
 	debug("dst:%s, gateway:%s, genmask:%s, metric:%d, flags:%d, type:%d, ifnumber:%d, expire_timer:%ld, holddown_timer:%ld", 
-		dst, gateway, genmask, rte->metric, rte->flags, rte->type, rte->recvif != NULL ? rte->recvif->ifnumber : -1, rte->expire_timer, rte->holddown_timer);
+		dst, gateway, genmask, rte->metric, rte->flags, rte->type, rte->recvif != NULL ? rte->recvif->ifnumber : -1,
+		 rte->expire_timer - time(NULL), rte->holddown_timer - time(NULL));
 }
 
 void print_re_list()
@@ -176,6 +178,8 @@ void print_rip_packet(rip_packet *packet, int rte_num)
  */
 int init_system()
 {
+
+	update_timer = time(NULL) + UPDATE_INTERVAL;
 	if_list = (interface_list*)malloc(sizeof(interface_list));
 	if (if_list == NULL) {
 		log_err("Failed to create interface list");
@@ -639,25 +643,33 @@ void process_rip_packet(rip_packet *rp, int rte_num, interface* recvif, in_addr_
 void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
 {
 	route_entry *re = re_list->head;
-	while (re) {
-		if (re->dst == r->ip && re->genmask == r->mask) {
-			//better rte
-			if (re->metric > r->mask + 1) {
-				debug("better rte");
-				route_entry old_re;
-				memcpy(&old_re, re, sizeof(route_entry));
-				re->metric = r->metric + 1;
+	while (re && re->type == NON_LOCAL_ROUTE_ENTRY && re->flags == VALID_ROUTE_ENTRY) {
+		if (re->dst == r->ip) {
+			route_entry old_re;
+			memcpy(&old_re, re, sizeof(route_entry));
+			//change the route entry when rip route's matrix +1 != route_entry's matrix
+			if (re->gateway == r->nexthop && re->metric != r->metric + 1) {
+				debug("must be changed rte");
+				re->metric = r->metric + 1 >= 16 ? 16 : r->metric + 1;
 				re->recvif = recvif;
-				re->gateway = sender_ip;
-
 				re_list_modify(&old_re, re);
-			} 
-			//don't change local route entry
-			if (re->type == NON_LOCAL_ROUTE_ENTRY) {
-				re->flags = VALID_ROUTE_ENTRY;
-				re->expire_timer = EXPIRE_INTERVAL;
-				re->holddown_timer = HODLDOWN_INTERVAL;
+			} else {
+				
+				//better rte
+				if (re->metric > r->metric + 1) {
+					debug("better rte");
+					re->metric = r->metric + 1;
+					re->recvif = recvif;
+					re->gateway = sender_ip;
+
+					re_list_modify(&old_re, re);
+				} 
 			}
+			
+			//update timers associated with specific route entry
+			time_t now = time(NULL);
+			re->expire_timer = now + EXPIRE_INTERVAL;
+			re->holddown_timer = now + EXPIRE_INTERVAL +  HODLDOWN_INTERVAL;
 	
 			return;
 		}
@@ -670,14 +682,15 @@ void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
 		log_err("Failed to create route entry");
 		return;
 	}
+	time_t now = time(NULL);
 	new_re->dst = r->ip;
 	new_re->gateway = sender_ip;
 	new_re->genmask = r->mask;
 	new_re->metric = r->metric + 1;
 	new_re->flags = VALID_ROUTE_ENTRY;
 	new_re->type = NON_LOCAL_ROUTE_ENTRY;
-	new_re->expire_timer = EXPIRE_INTERVAL;
-	new_re->holddown_timer = HODLDOWN_INTERVAL;
+	new_re->expire_timer = now + EXPIRE_INTERVAL;
+	new_re->holddown_timer = now + EXPIRE_INTERVAL +  HODLDOWN_INTERVAL;
 	new_re->recvif = recvif;
 
 	re_list_add(new_re);
@@ -734,9 +747,33 @@ int process_upcoming_msg(void *data)
 		log_info("Receive a route update message from fd:%d,which contain %d route entr%s", cif->recv_fd, rte_num, (rte_num == 1) ? "y\b": "ies");
 		print_rip_packet((rip_packet*)&buffer, rte_num);
 		process_rip_packet((rip_packet*)&buffer, rte_num, cif, sender_addr.sin_addr.s_addr);
-	}
+	} else
+		log_info("Ignore a packet send by itself!");
 
 	return 0;
+}
+
+void process_time_event()
+{
+
+	/**
+	 * loop through all the time event,judge whethe it should be triggered
+	 */
+	//1.check update timer
+	time_t cur_time = time(NULL);
+	if (update_timer <= cur_time) {
+		log_info("Broadcast routing table");
+		broadcast_update_msg();
+		update_timer = cur_time + UPDATE_INTERVAL;
+	}
+
+
+	//2. check expire_timer and holddown_timer in route_entry, 
+	//if expore_timer timeout change flag to INVALID_ROUTE_ENTRY, delete 
+	//holddown entry when its holddown timer is below or equall to zero
+	check_route_list();
+	//3. traverse the route entry list and print each route entry
+	//print_re_list();
 }
 
 /**
@@ -753,10 +790,9 @@ void check_route_list()
 		if (re->type != LOCAL_ROUTE_ENTRY) {
 			//decrease the expire timer
 			if (re->flags == VALID_ROUTE_ENTRY) {
-				re->expire_timer -= UPDATE_INTERVAL;
 				//set flag to INVALID_ROUTE_ENTRY, set matrix to INFINITY
 				//modify the kernel routing table
-				if (re->expire_timer <= 0) {
+				if (re->expire_timer <= time(NULL)) {
 
 					route_entry old_re;
 					memcpy(&old_re, re, sizeof(route_entry));
@@ -765,11 +801,9 @@ void check_route_list()
 					
 					re_list_modify(&old_re, re);
 				}
-			//decrease the holddown timer
 			} else {
-				re->holddown_timer -= UPDATE_INTERVAL;
 				//remove route entry from user space and kernel space routing table
-				if (re->holddown_timer <= 0) {
+				if (re->holddown_timer <= time(NULL)) {
 					log_info("Begin to delete route from route entry list");
 					print_route_entry(re);
 					re_list_delete(re);
@@ -810,6 +844,29 @@ void epoll_add_events(int efd)
 	}
 }
 
+/**
+ * search nearest time event
+ * @return when the nearest time event should be triggered
+ */
+time_t search_nearest_timer()
+{
+	time_t shortest = update_timer;
+	route_entry *re = re_list->head;
+	debug("update timer = %ld", update_timer);
+	while (re && re->type == NON_LOCAL_ROUTE_ENTRY) {
+		if (re->flags == VALID_ROUTE_ENTRY) {
+			if (re->expire_timer < shortest)
+				shortest = re->expire_timer;
+		} else {
+			if (re->holddown_timer < shortest)
+				shortest = re->holddown_timer;
+		}
+		re = re->next;
+	}
+
+	return shortest;
+}
+
 void start_route_service()
 {
 
@@ -829,24 +886,16 @@ void start_route_service()
 	//add events we focus on
 	epoll_add_events(efd);
 
-	int timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL);
 	while (1) {
 		int n, i;
-		time_t init_time = time(NULL);
 
+		time_t shortest = search_nearest_timer();
+		time_t now = time(NULL);
+		int timeout = abs(SECOND_TO_MILLSECOND(shortest - now));
+		debug("timeout = %d, time = %s", timeout, ctime(&now));
 		n = epoll_wait(efd, events, MAX_EPOLL_EVENTS, timeout);
-		if (n == 0) {
-			timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL);
-			log_info("Timeout");
-			//1. send route update message
-			broadcast_update_msg();
-			//2. update expire_timer and holddown_timer in route_entry, 
-			//remove the expired route_entry to holddown list, delete 
-			//holddown entry when its timer is to zero
-			check_route_list();
-			//3. traverse the route entry list and print each route entry
-			print_re_list();
-		} else {
+		debug("n = %d", n);
+		if (n > 0 ){
 			//read route update message from specific sock fd
 			for (i = 0; i < n; i++) {
 				if ((events[i].events & EPOLLERR) ||
@@ -860,9 +909,8 @@ void start_route_service()
 					process_upcoming_msg(events[i].data.ptr);
 				}	
 			}
-			timeout = SECOND_TO_MILLSECOND(UPDATE_INTERVAL-(time(NULL) - init_time));
 		}
-
+		process_time_event();
 	}
 }
 
@@ -889,7 +937,7 @@ int main(int argc, char const *argv[])
 		log_err("Failed to initialize system variables");
 		exit(EXIT_FAILURE);
 	}
-	res = init_ifs(active_ifs, 1);
+	res = init_ifs(active_ifs, argc -1);
 	if (res == -1) {
 		log_err("Failed to initialize all the interfaces");
 		exit(EXIT_FAILURE);
