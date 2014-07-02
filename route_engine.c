@@ -126,14 +126,14 @@ void print_route_entry(route_entry *rte)
 {
 	char dst[IP_STR_LEN];
 	char gateway[IP_STR_LEN];
-	char genmask[IP_STR_LEN];
+	char netmask[IP_STR_LEN];
 
 	assert(ip_to_str(rte->dst, dst) == 0);
 	assert(ip_to_str(rte->gateway, gateway) == 0);
-	assert(ip_to_str(rte->genmask, genmask) == 0);
+	assert(ip_to_str(rte->netmask, netmask) == 0);
 
-	debug("dst:%s, gateway:%s, genmask:%s, metric:%d, flags:%d, type:%d, ifnumber:%d, expire_timer:%ld, holddown_timer:%ld", 
-		dst, gateway, genmask, rte->metric, rte->flags, rte->type, rte->recvif != NULL ? rte->recvif->ifnumber : -1,
+	debug("dst:%s, gateway:%s, netmask:%s, metric:%d, flags:%d, type:%d, ifnumber:%d, expire_timer:%ld, holddown_timer:%ld", 
+		dst, gateway, netmask, rte->metric, rte->flags, rte->type, rte->recvif != NULL ? rte->recvif->ifnumber : -1,
 		 rte->expire_timer - time(NULL), rte->holddown_timer - time(NULL));
 }
 
@@ -154,8 +154,8 @@ void print_rte(rte *r)
 	char dst[IP_STR_LEN];
 	char gateway[IP_STR_LEN];
 
-	assert(ip_to_str(r->ip, dst) == 0);
-	assert(ip_to_str(r->nexthop, gateway) == 0);
+	assert(ip_to_str(r->dst, dst) == 0);
+	assert(ip_to_str(r->gateway, gateway) == 0);
 
 	debug("To:%s via:%s, metric is %d", dst, gateway, r->metric);
 }
@@ -408,7 +408,7 @@ int add_local_rtes()
 			continue;
 		}
 		cur_rte->dst = cur_if->network;
-		cur_rte->genmask = cur_if->mask;
+		cur_rte->netmask = cur_if->mask;
 		cur_rte->gateway = 0;
 		cur_rte->metric = 0;
 		cur_rte->type = LOCAL_ROUTE_ENTRY;
@@ -583,10 +583,10 @@ rip_packet *prepare_rip_packet(interface *cif, int *rte_num)
 		if (re->recvif != cif) {
 			cur_r->family = 0;
 			cur_r->tag = 0;
-			cur_r->ip = re->dst;
+			cur_r->dst = re->dst;
 
-			cur_r->mask = re->genmask;
-			cur_r->nexthop = re->gateway;
+			cur_r->netmask = re->netmask;
+			cur_r->gateway = re->gateway;
 			cur_r->metric = re->metric;
 			print_rte(cur_r);
 			cur_r++;
@@ -643,34 +643,45 @@ void process_rip_packet(rip_packet *rp, int rte_num, interface* recvif, in_addr_
 void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
 {
 	route_entry *re = re_list->head;
-	while (re && re->type == NON_LOCAL_ROUTE_ENTRY && re->flags == VALID_ROUTE_ENTRY) {
-		if (re->dst == r->ip) {
+	while (re) {
+		if (re->dst == r->dst) {
+			if (re->type == LOCAL_ROUTE_ENTRY)
+				return;
+
 			route_entry old_re;
 			memcpy(&old_re, re, sizeof(route_entry));
-			//change the route entry when rip route's matrix +1 != route_entry's matrix
-			if (re->gateway == r->nexthop && re->metric != r->metric + 1) {
-				debug("must be changed rte");
-				re->metric = r->metric + 1 >= 16 ? 16 : r->metric + 1;
-				re->recvif = recvif;
-				re_list_modify(&old_re, re);
+			//change the route entry when they are the same and rip route's matrix +1 != route_entry's matrix
+			if (re->gateway == sender_ip ) {
+				if (re->metric != r->metric + 1) {
+					debug("must be changed rte");
+					re->metric = r->metric + 1 >= 16 ? 16 : r->metric + 1;
+					re->recvif = recvif;
+					re_list_modify(&old_re, re);
+
+				}
+				//update timers associated with specific route entry
+				time_t now = time(NULL);
+				re->expire_timer = now + EXPIRE_INTERVAL;
+				re->holddown_timer = now + EXPIRE_INTERVAL +  HODLDOWN_INTERVAL;
+
 			} else {
 				
 				//better rte
 				if (re->metric > r->metric + 1) {
-					debug("better rte");
+					log_info("better rte");
 					re->metric = r->metric + 1;
 					re->recvif = recvif;
 					re->gateway = sender_ip;
 
 					re_list_modify(&old_re, re);
+
+					//update timers associated with specific route entry
+					time_t now = time(NULL);
+					re->expire_timer = now + EXPIRE_INTERVAL;
+					re->holddown_timer = now + EXPIRE_INTERVAL +  HODLDOWN_INTERVAL;
 				} 
 			}
 			
-			//update timers associated with specific route entry
-			time_t now = time(NULL);
-			re->expire_timer = now + EXPIRE_INTERVAL;
-			re->holddown_timer = now + EXPIRE_INTERVAL +  HODLDOWN_INTERVAL;
-	
 			return;
 		}
 		re = re->next;
@@ -683,9 +694,9 @@ void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
 		return;
 	}
 	time_t now = time(NULL);
-	new_re->dst = r->ip;
+	new_re->dst = r->dst;
 	new_re->gateway = sender_ip;
-	new_re->genmask = r->mask;
+	new_re->netmask = r->netmask;
 	new_re->metric = r->metric + 1;
 	new_re->flags = VALID_ROUTE_ENTRY;
 	new_re->type = NON_LOCAL_ROUTE_ENTRY;
