@@ -157,7 +157,7 @@ int kernel_route(int command, route_entry *re, route_entry *new_re)
 	req.rt.rtm_table = RT_TABLE_MAIN;
 	req.rt.rtm_protocol = RTPROT_STATIC;
 	req.rt.rtm_scope = RT_SCOPE_UNIVERSE;
-	req.rt.rtm_dst_len = count_prefix(re->genmask);
+	req.rt.rtm_dst_len = count_prefix(re->netmask);
 
 	/* Set up the message header and peer address */
 	memset(&msg, 0, sizeof(msg));

@@ -31,9 +31,9 @@ typedef struct if_list {
 typedef struct rte {
 	uint8_t family;
 	uint8_t tag;
-	in_addr_t ip;
-	in_addr_t mask;
-	in_addr_t nexthop;
+	in_addr_t dst;
+	in_addr_t netmask;
+	in_addr_t gateway;
 	uint32_t metric;
 } rte;
 
@@ -58,7 +58,7 @@ typedef struct rip_packet {
 //timer expires, the route is deleted from the routing table.
 typedef struct route_entry {
 	in_addr_t dst;
-	in_addr_t genmask;
+	in_addr_t netmask;
 	in_addr_t gateway;
 	uint32_t metric;
 	uint32_t type;
