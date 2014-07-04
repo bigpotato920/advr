@@ -36,6 +36,8 @@
 #define INFINITY 16
 #define NOTUSED_TIMER -1
 
+#define USUAL_UPDATE 0
+#define URGENT_UPDATE 1
 #define IP_STR_LEN 16
 #define SECOND_TO_MILLSECOND(second) ((second) * 1000)
 //a rip packet can contine 1 to 25(inclusize)rip route entry
@@ -63,9 +65,9 @@ int get_if_info(interface *cif);
 void get_broadcast(interface * cif);
 int set_if_fds(interface *cif);
 int sendto_if(interface *cif, rip_packet *rp, int size);
-void broadcast_update_msg();
+void broadcast_update_msg(int type);
 void send_rip_packet(rip_packet *rp, int rte_num, interface *cif);
-rip_packet *prepare_rip_packet(interface *cif, int *rte_num);
+rip_packet *prepare_rip_packet(interface *cif, int type, int *rte_num);
 int process_upcoming_msg(void *data);
 void process_time_event();
 void check_route_list();
@@ -73,7 +75,8 @@ void process_rip_packet(rip_packet *rp, int rte_num, interface *recvif, in_addr_
 void process_rte(rte *r, interface *recvif, in_addr_t sender_ip);
 int re_list_add(route_entry *new_re);
 int re_list_delete(route_entry *re);
-int re_list_modify(route_entry *re, route_entry *old);
+int re_list_modify(route_entry *old_re, route_entry *new_re);
+void copy_route_entry(route_entry *dst, route_entry *src);
 void start_route_service();
 
 interface_list *if_list;
@@ -132,8 +135,8 @@ void print_route_entry(route_entry *rte)
 	assert(ip_to_str(rte->gateway, gateway) == 0);
 	assert(ip_to_str(rte->netmask, netmask) == 0);
 
-	debug("dst:%s, gateway:%s, netmask:%s, metric:%d, flags:%d, type:%d, ifnumber:%d, expire_timer:%ld, holddown_timer:%ld", 
-		dst, gateway, netmask, rte->metric, rte->flags, rte->type, rte->recvif != NULL ? rte->recvif->ifnumber : -1,
+	debug("dst:%s, gateway:%s, netmask:%s, metric:%d, flags:%d, type:%d, ifname:%s, expire_timer:%ld, holddown_timer:%ld", 
+		dst, gateway, netmask, rte->metric, rte->flags, rte->type, rte->recvif != NULL ? rte->recvif->ifname : "no ifname",
 		 rte->expire_timer - time(NULL), rte->holddown_timer - time(NULL));
 }
 
@@ -407,7 +410,7 @@ int add_local_rtes()
 			log_err("Failed to create route entry");
 			continue;
 		}
-		cur_rte->dst = cur_if->network;
+		cur_rte->dst =  cur_if->network;
 		cur_rte->netmask = cur_if->mask;
 		cur_rte->gateway = 0;
 		cur_rte->metric = 0;
@@ -495,13 +498,14 @@ int re_list_delete(route_entry *cur_re)
 int re_list_modify(route_entry *old_re, route_entry *new_re)
 {
 	int res;
-
 	log_info("upate a route entry");
-	res = kernel_route(ROUTE_MOD, old_re, new_re);
-	debug("From:");
+	log_info("From:");
 	print_route_entry(old_re);
-	debug("To:");
+	log_info("To:");
 	print_route_entry(new_re);
+	
+	res = kernel_route(ROUTE_MOD, old_re, new_re);
+	copy_route_entry(old_re, new_re);
 
 	return res;
 }
@@ -552,15 +556,20 @@ int sendto_if(interface *cif, rip_packet *rp, int size)
  *@param rte_num get the rip route entry number
  *@return rip packet construct for specific interface
  */
-rip_packet *prepare_rip_packet(interface *cif, int *rte_num)
+rip_packet *prepare_rip_packet(interface *cif, int type, int *rte_num)
 {
 	
-	route_entry *re = re_list->head;
+	route_entry *re = NULL;
 	rte *cur_r = NULL;
     rip_packet *rp = NULL;
 
-    *rte_num = count_re4if(cif);
 
+    if (type == USUAL_UPDATE) {
+    	re = re_list->head;
+    	*rte_num = count_re4if(cif);
+    } else {
+    	return NULL;
+    }
     debug("prepare rip packet rte_num = %d", *rte_num);
     int rip_packet_size = sizeof(rip_packet) + (*rte_num) * sizeof(rte);
     rp = (rip_packet*)malloc(rip_packet_size);
@@ -588,7 +597,7 @@ rip_packet *prepare_rip_packet(interface *cif, int *rte_num)
 			cur_r->netmask = re->netmask;
 			cur_r->gateway = re->gateway;
 			cur_r->metric = re->metric;
-			print_rte(cur_r);
+			//print_rte(cur_r);
 			cur_r++;
 		}
 
@@ -634,91 +643,109 @@ void process_rip_packet(rip_packet *rp, int rte_num, interface* recvif, in_addr_
 	debug("leave process_rip_packet");
 }
 
-/**
- * process rte resides in the rip packet
- * @param r         rip route entry
- * @param recvif    from which interface receive the packet
- * @param sender_ip sender ip of the packet,which will be the gateway in the route entry 
- */
-void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
+route_entry *search4rte(rte *r)
 {
 	route_entry *re = re_list->head;
 	while (re) {
-		if (re->dst == r->dst) {
-			if (re->type == LOCAL_ROUTE_ENTRY)
-				return;
-
-			route_entry old_re;
-			memcpy(&old_re, re, sizeof(route_entry));
-			//change the route entry when they are the same and rip route's matrix +1 != route_entry's matrix
-			if (re->gateway == sender_ip ) {
-				if (re->metric != r->metric + 1) {
-					debug("must be changed rte");
-					re->metric = r->metric + 1 >= 16 ? 16 : r->metric + 1;
-					re->recvif = recvif;
-					re_list_modify(&old_re, re);
-
-				}
-				//update timers associated with specific route entry
-				time_t now = time(NULL);
-				re->expire_timer = now + EXPIRE_INTERVAL;
-				re->holddown_timer = now + EXPIRE_INTERVAL +  HODLDOWN_INTERVAL;
-
-			} else {
-				
-				//better rte
-				if (re->metric > r->metric + 1) {
-					log_info("better rte");
-					re->metric = r->metric + 1;
-					re->recvif = recvif;
-					re->gateway = sender_ip;
-
-					re_list_modify(&old_re, re);
-
-					//update timers associated with specific route entry
-					time_t now = time(NULL);
-					re->expire_timer = now + EXPIRE_INTERVAL;
-					re->holddown_timer = now + EXPIRE_INTERVAL +  HODLDOWN_INTERVAL;
-				} 
-			}
-			
-			return;
-		}
+		if (re->dst == r->dst)
+			return re;
 		re = re->next;
 	}
-	//fresh rte
-	debug("fresh rte");
-	route_entry *new_re = (route_entry*)malloc(sizeof(route_entry));
-	if (new_re == NULL) {
-		log_err("Failed to create route entry");
+
+	return NULL;
+}
+
+int is_better_re(route_entry *new_re, route_entry *old_re)
+{
+	if (new_re->metric < old_re->metric)
+		return 1;
+	return 0;
+}
+
+int is_same_gateway(route_entry *new_re, route_entry *old_re)
+{
+	return new_re->gateway == old_re->gateway;
+}
+
+void copy_route_entry(route_entry *dst, route_entry *src)
+{
+	route_entry *old_next = dst->next;
+	memcpy(dst, src, sizeof(route_entry));
+	dst->next = old_next;
+}
+
+void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
+{
+
+	r->metric = (r->metric + 1 >= INFINITY ? INFINITY : r->metric + 1);
+	in_addr_t gateway;
+
+	gateway = sender_ip;
+
+	route_entry *old_re = search4rte(r);
+	route_entry new_re;
+	route_entry *new_re_p = NULL;
+
+	time_t now = time(NULL);
+	new_re.dst = r->dst;
+	new_re.gateway = gateway;
+	new_re.netmask = r->netmask;
+	new_re.metric = r->metric;
+
+	if (r->metric != INFINITY) {
+		new_re.flags = VALID_ROUTE_ENTRY;
+		new_re.expire_timer = now + EXPIRE_INTERVAL;
+		new_re.holddown_timer = now + EXPIRE_INTERVAL +  HODLDOWN_INTERVAL;
+	}
+	else{
+		log_info("Receive an expired route entry");
+		new_re.flags = INVALID_ROUTE_ENTRY;
+		new_re.expire_timer = old_re->expire_timer;
+		new_re.holddown_timer = old_re->holddown_timer;
+	}
+	new_re.type = NON_LOCAL_ROUTE_ENTRY;
+	new_re.recvif = recvif;
+
+	if (old_re) {
+
+		if (old_re->type == LOCAL_ROUTE_ENTRY || old_re->flags == INVALID_ROUTE_ENTRY)
+			return;
+		if (is_better_re(&new_re, old_re) || (is_same_gateway(&new_re, old_re) && (new_re.metric != old_re->metric))){
+			re_list_modify(old_re, &new_re);
+			return;  
+		} else  if (is_same_gateway(&new_re, old_re)) {
+			old_re->expire_timer = now + EXPIRE_INTERVAL;
+			old_re->holddown_timer = now + EXPIRE_INTERVAL + UPDATE_INTERVAL;
+		}
+
 		return;
 	}
-	time_t now = time(NULL);
-	new_re->dst = r->dst;
-	new_re->gateway = sender_ip;
-	new_re->netmask = r->netmask;
-	new_re->metric = r->metric + 1;
-	new_re->flags = VALID_ROUTE_ENTRY;
-	new_re->type = NON_LOCAL_ROUTE_ENTRY;
-	new_re->expire_timer = now + EXPIRE_INTERVAL;
-	new_re->holddown_timer = now + EXPIRE_INTERVAL +  HODLDOWN_INTERVAL;
-	new_re->recvif = recvif;
 
-	re_list_add(new_re);
+	if (new_re.flags == INVALID_ROUTE_ENTRY)
+		return;
+	//fresh rte
+	debug("fresh rte");
+	new_re_p = (route_entry*)malloc(sizeof(route_entry));
+	if (new_re_p == NULL) {
+		log_err("Failed to create new_re");
+		return;
+	}
+	memcpy(new_re_p, &new_re, sizeof(route_entry));
+	re_list_add(new_re_p);
 }
 
 /**
  * broad cast route entry update message
  */
-void broadcast_update_msg()
+void broadcast_update_msg(int type)
 {
 	rip_packet *rp = NULL;
 	interface *cif = if_list->head;
     int rte_num = 0;
-
+    assert(type == USUAL_UPDATE || type == URGENT_UPDATE);
 	for (; cif != NULL; cif = cif->next) {
 		if (cif->active) {
-			rp = prepare_rip_packet(cif, &rte_num);
+			rp = prepare_rip_packet(cif, USUAL_UPDATE, &rte_num);
 			assert(rp != NULL);
 			send_rip_packet(rp, rte_num, cif);
 			free(rp);
@@ -755,7 +782,7 @@ int process_upcoming_msg(void *data)
 		rte_num = get_rte_num(nread);
 		assert(rte_num > 0);
 		debug("nread = %d", nread);
-		log_info("Receive a route update message from fd:%d,which contain %d route entr%s", cif->recv_fd, rte_num, (rte_num == 1) ? "y\b": "ies");
+		log_info("Receive a route update message from interface:%s,which contain %d route entr%s", cif->ifname, rte_num, (rte_num == 1) ? "y\b": "ies");
 		print_rip_packet((rip_packet*)&buffer, rte_num);
 		process_rip_packet((rip_packet*)&buffer, rte_num, cif, sender_addr.sin_addr.s_addr);
 	} else
@@ -773,8 +800,8 @@ void process_time_event()
 	//1.check update timer
 	time_t cur_time = time(NULL);
 	if (update_timer <= cur_time) {
-		log_info("Broadcast routing table");
-		broadcast_update_msg();
+		print_re_list();
+		broadcast_update_msg(USUAL_UPDATE);
 		update_timer = cur_time + UPDATE_INTERVAL;
 	}
 
@@ -805,17 +832,20 @@ void check_route_list()
 				//modify the kernel routing table
 				if (re->expire_timer <= time(NULL)) {
 
-					route_entry old_re;
-					memcpy(&old_re, re, sizeof(route_entry));
-					re->flags = INVALID_ROUTE_ENTRY;
-					re->metric = INFINITY;
+					route_entry new_re;
+					memcpy(&new_re, re, sizeof(route_entry));
+					new_re.flags = INVALID_ROUTE_ENTRY;
+					new_re.metric = INFINITY;
 					
-					re_list_modify(&old_re, re);
+					log_info("find an invalid route entry try to broadcast to all neighbors");
+					re_list_modify(re, &new_re);
+					
+					//broadcast_update_msg(URGENT_UPDATE);
 				}
 			} else {
 				//remove route entry from user space and kernel space routing table
 				if (re->holddown_timer <= time(NULL)) {
-					log_info("Begin to delete route from route entry list");
+					log_err("Begin to delete route from route entry list");
 					print_route_entry(re);
 					re_list_delete(re);
 				}
