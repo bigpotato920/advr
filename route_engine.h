@@ -76,4 +76,10 @@ typedef struct route_entry_list {
 	int length;
 	route_entry *head;
 } route_entry_list;
+
+typedef struct advp {
+	time_t update_timer;
+	interface *if_list_head;
+	route_entry *re_list_head;
+} advp;
 #endif

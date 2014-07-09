@@ -79,9 +79,7 @@ int re_list_modify(route_entry *old_re, route_entry *new_re);
 void copy_route_entry(route_entry *dst, route_entry *src);
 void start_route_service();
 
-interface_list *if_list;
-route_entry_list *re_list;
-time_t update_timer = -1;
+advp *m_advp = NULL;
 /**
  * Judge whether the ip is a local interface bounded ip
  * @param  ip ip address in network order
@@ -89,7 +87,7 @@ time_t update_timer = -1;
  */
 int is_local_ip(in_addr_t ip)
 {
-	interface *cif = if_list->head;
+	interface *cif = m_advp->if_list_head;
 	while (cif) {
 		if (ip == cif->ip)
 			return 1;
@@ -143,7 +141,7 @@ void print_route_entry(route_entry *rte)
 void print_re_list()
 {
 	log_info("main routing table");
-	route_entry *re = re_list->head;
+	route_entry *re = m_advp->re_list_head;
 	while (re) {
 		print_route_entry(re);
 		re = re->next;
@@ -182,22 +180,14 @@ void print_rip_packet(rip_packet *packet, int rte_num)
 int init_system()
 {
 
-	update_timer = time(NULL) + UPDATE_INTERVAL;
-	if_list = (interface_list*)malloc(sizeof(interface_list));
-	if (if_list == NULL) {
-		log_err("Failed to create interface list");
+	m_advp = (advp*)malloc(sizeof(advp));
+	if (m_advp == NULL) {
+		log_err("Failed to create advp structure");
 		return -1;
 	}
-	if_list->length = 0;
-	if_list->head = NULL;
-
-	re_list = (route_entry_list*)malloc(sizeof(route_entry_list));
-	if (re_list == NULL) {
-		log_err("Failed to create route entry list");
-		return -1;
-	}
-	re_list->length = 0;
-	re_list->head = NULL;
+	m_advp->update_timer = time(NULL) + UPDATE_INTERVAL;
+	m_advp->if_list_head = NULL;
+	m_advp->re_list_head = NULL;
 
 	return 0;
 }
@@ -244,24 +234,24 @@ int init_ifs(const char **active_ifs, int n)
 			continue;
 		}
 		//insert the current interface to the head of the list
-		if (if_list->head == NULL) {
+		if (m_advp->if_list_head == NULL) {
 
-			if_list->head = cur_if;
+			m_advp->if_list_head = cur_if;
 			cur_if->next = NULL;
 
 		} else {
-			cur_if->next = if_list->head;
-			if_list->head = cur_if;
+			cur_if->next = m_advp->if_list_head;
+			m_advp->if_list_head = cur_if;
 		}
-		if_list->length++;
+		
 	}
 
-	cur_if = if_list->head;
+	cur_if = m_advp->if_list_head;
 	while (cur_if != NULL) {
 		print_if(cur_if);
 		cur_if = cur_if->next;
 	}
-	assert(if_list != NULL);
+	
 	return 0;
 }
 /**
@@ -400,7 +390,7 @@ int set_if_fds(interface *cif)
  */
 int add_local_rtes()
 {
-	interface *cur_if = if_list->head;
+	interface *cur_if = m_advp->if_list_head;
 	route_entry *cur_rte = NULL;
 	assert(cur_if != NULL);
 
@@ -420,18 +410,17 @@ int add_local_rtes()
 		cur_rte->holddown_timer = NOTUSED_TIMER;
 		cur_rte->recvif = NULL;
 
-		if (re_list->head == NULL) {
+		if (m_advp->re_list_head == NULL) {
 			cur_rte->next = NULL;
-			re_list->head = cur_rte;
+			m_advp->re_list_head = cur_rte;
 		} else {
-			cur_rte->next = re_list->head;
-			re_list->head = cur_rte;
+			cur_rte->next = m_advp->re_list_head;
+			m_advp->re_list_head = cur_rte;
 		}
 		cur_if = cur_if->next;
-		re_list->length++;
 	}
 
-	cur_rte = re_list->head;
+	cur_rte = m_advp->re_list_head;
     //just for debugging
 	while (cur_rte) {
 		print_route_entry(cur_rte);
@@ -451,9 +440,8 @@ int re_list_add(route_entry *new_re)
 {
 	int res;
 
-	new_re->next = re_list->head;
-	re_list->head = new_re;
-	re_list->length++;
+	new_re->next = m_advp->re_list_head;
+	m_advp->re_list_head = new_re;
 	
 	res = kernel_route(ROUTE_ADD, new_re, NULL);
 	log_info("new route entry inserted");
@@ -484,7 +472,7 @@ int re_list_delete(route_entry *cur_re)
 		cur_re->next = next_re->next;
 		free(next_re);
 	}
-	re_list->length--;
+
 
 	return res == 0 ? 0 : -1;
 }
@@ -517,7 +505,7 @@ int re_list_modify(route_entry *old_re, route_entry *new_re)
  */
 int count_re4if(interface *cif)
 {
-	route_entry *re = re_list->head;
+	route_entry *re = m_advp->re_list_head;
 	int cnt = 0;
 	while (re) {
 		if (re->recvif != cif)
@@ -565,7 +553,7 @@ rip_packet *prepare_rip_packet(interface *cif, int type, int *rte_num)
 
 
     if (type == USUAL_UPDATE) {
-    	re = re_list->head;
+    	re = m_advp->re_list_head;
     	*rte_num = count_re4if(cif);
     } else {
     	return NULL;
@@ -645,7 +633,7 @@ void process_rip_packet(rip_packet *rp, int rte_num, interface* recvif, in_addr_
 
 route_entry *search4rte(rte *r)
 {
-	route_entry *re = re_list->head;
+	route_entry *re = m_advp->re_list_head;
 	while (re) {
 		if (re->dst == r->dst)
 			return re;
@@ -740,7 +728,7 @@ void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
 void broadcast_update_msg(int type)
 {
 	rip_packet *rp = NULL;
-	interface *cif = if_list->head;
+	interface *cif = m_advp->if_list_head;
     int rte_num = 0;
     assert(type == USUAL_UPDATE || type == URGENT_UPDATE);
 	for (; cif != NULL; cif = cif->next) {
@@ -799,10 +787,10 @@ void process_time_event()
 	 */
 	//1.check update timer
 	time_t cur_time = time(NULL);
-	if (update_timer <= cur_time) {
+	if (m_advp->update_timer <= cur_time) {
 		print_re_list();
 		broadcast_update_msg(USUAL_UPDATE);
-		update_timer = cur_time + UPDATE_INTERVAL;
+		m_advp->update_timer = cur_time + UPDATE_INTERVAL;
 	}
 
 
@@ -822,7 +810,7 @@ void process_time_event()
  */
 void check_route_list()
 {
-	route_entry *re = re_list->head;
+	route_entry *re = m_advp->re_list_head;
 	while (re != NULL) {
 		//LOCAL ROUTE ENTRY will never expire
 		if (re->type != LOCAL_ROUTE_ENTRY) {
@@ -864,7 +852,7 @@ void check_route_list()
  */
 void epoll_add_events(int efd)
 {
-	interface *cur_if = if_list->head;
+	interface *cur_if = m_advp->if_list_head;
 	assert(cur_if != NULL);
 	struct epoll_event event;
 	int res;
@@ -891,9 +879,9 @@ void epoll_add_events(int efd)
  */
 time_t search_nearest_timer()
 {
-	time_t shortest = update_timer;
-	route_entry *re = re_list->head;
-	debug("update timer = %ld", update_timer);
+	time_t shortest = m_advp->update_timer;
+	route_entry *re = m_advp->re_list_head;
+	debug("update timer = %ld", m_advp->update_timer);
 	while (re && re->type == NON_LOCAL_ROUTE_ENTRY) {
 		if (re->flags == VALID_ROUTE_ENTRY) {
 			if (re->expire_timer < shortest)
