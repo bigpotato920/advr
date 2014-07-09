@@ -12,13 +12,17 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <time.h>
+#include <pthread.h>
+
 #include "log.h"
 #include "route_engine.h"
 #include "kroute.h"
+#include "detector.h"
 
-#define UPDATE_INTERVAL 15
+#define ROUTE_UPDATE_INTERVAL 15
 #define EXPIRE_INTERVAL 30
 #define HODLDOWN_INTERVAL 15
+#define GW_UPATE_INTERVAL 30
 #define RIP_RESPONSE 0
 #define RIP_REQUEST 1
 #define RIP_VERSION 2
@@ -78,6 +82,8 @@ int re_list_delete(route_entry *re);
 int re_list_modify(route_entry *old_re, route_entry *new_re);
 void copy_route_entry(route_entry *dst, route_entry *src);
 void start_route_service();
+int create_detection_thread();
+
 
 advp *m_advp = NULL;
 /**
@@ -185,10 +191,33 @@ int init_system()
 		log_err("Failed to create advp structure");
 		return -1;
 	}
-	m_advp->update_send_timer = time(NULL) + UPDATE_INTERVAL;
+	m_advp->update_send_timer = time(NULL) + ROUTE_UPDATE_INTERVAL;
+	m_advp->gw_update_timer = time(NULL) + GW_UPATE_INTERVAL;
 	m_advp->if_list_head = NULL;
 	m_advp->re_list_head = NULL;
+	m_advp->gi_list = (gw_info_list*)malloc(sizeof(gw_info_list));
+	if (m_advp->gi_list == NULL) {
+		log_err("Failed to create gateway info list");
+		return -1;
+	}
+	gw_info_entry *own_gw = (gw_info_entry*)malloc(sizeof(gw_info_entry));
+	if (own_gw == NULL) {
+		log_err("Failed to create own gateway info entry");
+		free(m_advp->gi_list);
+		return -1;
+	}
 
+	m_advp->gi_list->own_gw = own_gw;
+	m_advp->gi_list->best_gw = own_gw;
+	m_advp->gi_list->gw_info_head = own_gw;
+	if (pthread_mutex_init(&m_advp->gi_list->gw_info_lock, NULL) != 0) {
+		log_err("Failed to initialize gi list's lock");
+		free(own_gw);
+		free(m_advp->gi_list);
+		return -1;
+	}
+
+	m_advp->gi_list->ping_ip = inet_addr("222.128.13.159");
 	return 0;
 }
 
@@ -703,7 +732,7 @@ void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
 			return;  
 		} else  if (is_same_gateway(&new_re, old_re)) {
 			old_re->expire_timer = now + EXPIRE_INTERVAL;
-			old_re->holddown_timer = now + EXPIRE_INTERVAL + UPDATE_INTERVAL;
+			old_re->holddown_timer = now + EXPIRE_INTERVAL + ROUTE_UPDATE_INTERVAL;
 		}
 
 		return;
@@ -790,9 +819,15 @@ void process_time_event()
 	if (m_advp->update_send_timer <= cur_time) {
 		print_re_list();
 		broadcast_update_msg(USUAL_UPDATE);
-		m_advp->update_send_timer = cur_time + UPDATE_INTERVAL;
+		m_advp->update_send_timer = cur_time + ROUTE_UPDATE_INTERVAL;
 	}
 
+	if (m_advp->gw_update_timer <= cur_time) {
+		pthread_mutex_lock(&(m_advp->gi_list->gw_info_lock));
+		printf("avg rtt = %f\n", m_advp->gi_list->own_gw->rtt);
+		pthread_mutex_unlock(&(m_advp->gi_list->gw_info_lock));
+		m_advp->gw_update_timer = cur_time + GW_UPATE_INTERVAL;
+	}
 
 	//2. check expire_timer and holddown_timer in route_entry, 
 	//if expore_timer timeout change flag to INVALID_ROUTE_ENTRY, delete 
@@ -848,7 +883,6 @@ void check_route_list()
 /**
  * add various events to epoll
  * @param efd epool fd
- * @TODO add interface to the event.data.ptr,so we can get more information when socket is ready
  */
 void epoll_add_events(int efd)
 {
@@ -896,6 +930,22 @@ time_t search_nearest_timer()
 	return shortest;
 }
 
+int create_detection_thread()
+{
+
+	pthread_t detection_thread;
+	int rv;
+	rv = pthread_create(&detection_thread, NULL, 
+		start_detection_service, (void*)m_advp->gi_list);
+   	
+   	if (rv != 0) {
+   		
+   		return -1;
+   	}
+
+   	return 0;
+}
+
 void start_route_service()
 {
 
@@ -922,6 +972,8 @@ void start_route_service()
 		time_t now = time(NULL);
 		int timeout = abs(SECOND_TO_MILLSECOND(shortest - now));
 		debug("timeout = %d, time = %s", timeout, ctime(&now));
+
+
 		n = epoll_wait(efd, events, MAX_EPOLL_EVENTS, timeout);
 		debug("n = %d", n);
 		if (n > 0 ){
@@ -974,6 +1026,11 @@ int main(int argc, char const *argv[])
 	res = add_local_rtes();
 	if (res == -1) {
 		log_err("Failed to add local route entries");
+		exit(EXIT_FAILURE);
+	}
+	res = create_detection_thread();
+	if (res == -1) {
+		log_err("Failed to create detection thread");
 		exit(EXIT_FAILURE);
 	}
 	start_route_service();

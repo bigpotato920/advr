@@ -5,6 +5,7 @@
 #include <net/if.h>
 #include <stdint.h>
 #include <netinet/in.h>
+#include <pthread.h>
 
 typedef struct interface {
 	char ifname[IFNAMSIZ];
@@ -20,11 +21,6 @@ typedef struct interface {
 	struct interface * next;
 
 } interface;
-
-typedef struct if_list {
-	int length;
-	interface *head;
-} interface_list;
 
 //RIP2 entry
 #pragma pack(push, 1)
@@ -71,16 +67,31 @@ typedef struct route_entry {
 	struct route_entry *next;
 } route_entry;
 
+typedef struct gw_info_entry {
+	in_addr_t ip;
+	uint8_t hop_count;
+	double rtt;
+	double payload;
+	uint8_t sat_sigal;
+	struct gw_info_entry *next;
 
-typedef struct route_entry_list {
-	int length;
-	route_entry *head;
-} route_entry_list;
+} gw_info_entry;
+
+typedef struct gw_info_list {
+	gw_info_entry *gw_info_head;
+	pthread_mutex_t gw_info_lock;
+	gw_info_entry *best_gw;
+	gw_info_entry *own_gw;
+	in_addr_t ping_ip;
+} gw_info_list;
 
 typedef struct advp {
 	time_t update_send_timer;
 	time_t gw_update_timer;
 	interface *if_list_head;
 	route_entry *re_list_head;
+	gw_info_list *gi_list;
+
 } advp;
+
 #endif
