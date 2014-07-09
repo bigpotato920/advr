@@ -185,7 +185,7 @@ int init_system()
 		log_err("Failed to create advp structure");
 		return -1;
 	}
-	m_advp->update_timer = time(NULL) + UPDATE_INTERVAL;
+	m_advp->update_send_timer = time(NULL) + UPDATE_INTERVAL;
 	m_advp->if_list_head = NULL;
 	m_advp->re_list_head = NULL;
 
@@ -787,10 +787,10 @@ void process_time_event()
 	 */
 	//1.check update timer
 	time_t cur_time = time(NULL);
-	if (m_advp->update_timer <= cur_time) {
+	if (m_advp->update_send_timer <= cur_time) {
 		print_re_list();
 		broadcast_update_msg(USUAL_UPDATE);
-		m_advp->update_timer = cur_time + UPDATE_INTERVAL;
+		m_advp->update_send_timer = cur_time + UPDATE_INTERVAL;
 	}
 
 
@@ -879,9 +879,9 @@ void epoll_add_events(int efd)
  */
 time_t search_nearest_timer()
 {
-	time_t shortest = m_advp->update_timer;
+	time_t shortest = m_advp->update_send_timer;
 	route_entry *re = m_advp->re_list_head;
-	debug("update timer = %ld", m_advp->update_timer);
+	debug("update timer = %ld", m_advp->update_send_timer);
 	while (re && re->type == NON_LOCAL_ROUTE_ENTRY) {
 		if (re->flags == VALID_ROUTE_ENTRY) {
 			if (re->expire_timer < shortest)
