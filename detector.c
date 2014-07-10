@@ -162,7 +162,7 @@ int start_service(int sockfd, gw_info_list *gi_list)
         if (res == 0) {
             if (packet_send < MAX_PACKET_NUM) {
                 int packet_size;
-             
+                memset(sendpacket, 0, PACKET_SIZE);
                 packet_size = pack(packet_send, sendpacket);
                 if (sendto(sockfd,sendpacket,packet_size,0,
                     (struct sockaddr *)&dest_addr,sizeof(dest_addr)) < 0) {
