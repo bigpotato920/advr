@@ -23,6 +23,10 @@
 #define EXPIRE_INTERVAL 30
 #define HODLDOWN_INTERVAL 15
 #define GW_UPATE_INTERVAL 30
+#define GW_EXPIRE_INTERVAL 60
+#define LOCAL_GI_ENTRY 0
+#define NONLOCAL_GI_ENTRY 1
+
 #define RIP_RESPONSE 0
 #define RIP_REQUEST 1
 #define RIP_VERSION 2
@@ -50,6 +54,8 @@
 #define get_rte_num(packet_size)((packet_size - sizeof(rip_packet)) / sizeof(rte)) 
 #define get_rip_packet_size(rte_num) (sizeof(rip_packet) + rte_num * sizeof(rte))
 
+
+#define DAFAULT_GW "10.103.240.200"
 //utility function
 int is_local_ip(in_addr_t ip);
 int ip_to_str(in_addr_t ip, char *str);
@@ -75,6 +81,7 @@ rip_packet *prepare_rip_packet(interface *cif, int type, int *rte_num);
 int process_upcoming_msg(void *data);
 void process_time_event();
 void check_route_list();
+void check_gi_list();
 void process_rip_packet(rip_packet *rp, int rte_num, interface *recvif, in_addr_t sender_ip);
 void process_rte(rte *r, interface *recvif, in_addr_t sender_ip);
 int re_list_add(route_entry *new_re);
@@ -206,6 +213,13 @@ int init_system()
 		free(m_advp->gi_list);
 		return -1;
 	}
+	own_gw->hop_count = 0;
+	own_gw->ip = inet_addr(DAFAULT_GW);
+	own_gw->sat_sigal = 0;
+	own_gw->rtt = 5.0;
+	own_gw->type = LOCAL_GI_ENTRY;
+	own_gw->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+	own_gw->next = NULL;
 
 	m_advp->gi_list->own_gw = own_gw;
 	m_advp->gi_list->best_gw = own_gw;
@@ -527,6 +541,20 @@ int re_list_modify(route_entry *old_re, route_entry *new_re)
 	return res;
 }
 
+void gi_list_delete(gw_info_entry *cur_gi_entry)
+{
+	if (cur_gi_entry->next == NULL) {
+		free(cur_gi_entry);
+		cur_gi_entry = NULL;
+
+	} else {
+		gw_info_entry *next_gi_entry = cur_gi_entry->next;
+		memcpy(cur_gi_entry, next_gi_entry, sizeof(gw_info_entry));
+		cur_gi_entry->next = next_gi_entry->next;
+		free(next_gi_entry);
+	}
+}
+
 /**
  * count how many route entry should send through specific interface
  * @param  cif which interface to send to
@@ -835,6 +863,7 @@ void process_time_event()
 	check_route_list();
 	//3. traverse the route entry list and print each route entry
 	//print_re_list();
+	check_gi_list();
 }
 
 /**
@@ -880,6 +909,21 @@ void check_route_list()
 	}
 }
 
+void check_gi_list()
+{
+	gw_info_list *gi_list = m_advp->gi_list;
+	pthread_mutex_lock(&(gi_list->gw_info_lock));
+	gw_info_entry *gi_entry = gi_list->gw_info_head;
+
+	while (gi_entry != NULL) {
+		if (gi_entry->type == NONLOCAL_GI_ENTRY && gi_entry->expire_timer <= time(NULL)) {
+			gi_list_delete(gi_entry);
+		}
+		gi_entry = gi_entry->next;
+	}
+	pthread_mutex_unlock(&(gi_list->gw_info_lock));
+}
+
 /**
  * add various events to epoll
  * @param efd epool fd
@@ -915,6 +959,8 @@ time_t search_nearest_timer()
 {
 	time_t shortest = m_advp->update_send_timer;
 	route_entry *re = m_advp->re_list_head;
+	gw_info_entry *gi_entry = m_advp->gi_list->gw_info_head;
+
 	debug("update timer = %ld", m_advp->update_send_timer);
 	while (re && re->type == NON_LOCAL_ROUTE_ENTRY) {
 		if (re->flags == VALID_ROUTE_ENTRY) {
@@ -925,6 +971,12 @@ time_t search_nearest_timer()
 				shortest = re->holddown_timer;
 		}
 		re = re->next;
+	}
+
+	while (gi_entry && gi_entry->type == NONLOCAL_GI_ENTRY) {
+		if (gi_entry->expire_timer < shortest)
+			shortest = gi_entry->expire_timer;
+		gi_entry = gi_entry->next;
 	}
 
 	return shortest;

@@ -73,6 +73,8 @@ typedef struct gw_info_entry {
 	double rtt;
 	double payload;
 	uint8_t sat_sigal;
+	uint8_t type;
+	time_t expire_timer;
 	struct gw_info_entry *next;
 
 } gw_info_entry;
