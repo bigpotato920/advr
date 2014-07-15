@@ -81,7 +81,7 @@ rip_packet *prepare_rip_packet(interface *cif, int type, int *rte_num);
 int process_upcoming_msg(void *data);
 void process_time_event();
 void check_route_list();
-void check_gi_list();
+void check_gw_info();
 void process_rip_packet(rip_packet *rp, int rte_num, interface *recvif, in_addr_t sender_ip);
 void process_rte(rte *r, interface *recvif, in_addr_t sender_ip);
 int re_list_add(route_entry *new_re);
@@ -199,39 +199,22 @@ int init_system()
 		return -1;
 	}
 	m_advp->update_send_timer = time(NULL) + ROUTE_UPDATE_INTERVAL;
-	m_advp->gw_update_timer = time(NULL) + GW_UPATE_INTERVAL;
 	m_advp->if_list_head = NULL;
 	m_advp->re_list_head = NULL;
-	m_advp->gi_list = (gw_info_list*)malloc(sizeof(gw_info_list));
-	if (m_advp->gi_list == NULL) {
-		log_err("Failed to create gateway info list");
-		return -1;
-	}
-	gw_info_entry *own_gw = (gw_info_entry*)malloc(sizeof(gw_info_entry));
-	if (own_gw == NULL) {
-		log_err("Failed to create own gateway info entry");
-		free(m_advp->gi_list);
-		return -1;
-	}
-	own_gw->hop_count = 0;
-	own_gw->ip = inet_addr(DAFAULT_GW);
-	own_gw->sat_sigal = 0;
-	own_gw->rtt = 5.0;
-	own_gw->type = LOCAL_GI_ENTRY;
-	own_gw->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
-	own_gw->next = NULL;
 
-	m_advp->gi_list->own_gw = own_gw;
-	m_advp->gi_list->best_gw = own_gw;
-	m_advp->gi_list->gw_info_head = own_gw;
-	if (pthread_mutex_init(&m_advp->gi_list->gw_info_lock, NULL) != 0) {
+	m_advp->gw_info = (gateway_info*)malloc(sizeof(gateway_info));
+
+	m_advp->gw_info->gw_ip = inet_addr(DAFAULT_GW);
+	m_advp->gw_info->rtt = 5;
+	m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+
+	if (pthread_mutex_init(&m_advp->gw_info->gw_info_lock, NULL) != 0) {
 		log_err("Failed to initialize gi list's lock");
-		free(own_gw);
-		free(m_advp->gi_list);
+		free(m_advp->gw_info);
 		return -1;
 	}
 
-	m_advp->gi_list->ping_ip = inet_addr("222.128.13.159");
+	m_advp->gw_info->ping_ip = inet_addr("222.128.13.159");
 	return 0;
 }
 
@@ -541,19 +524,7 @@ int re_list_modify(route_entry *old_re, route_entry *new_re)
 	return res;
 }
 
-void gi_list_delete(gw_info_entry *cur_gi_entry)
-{
-	if (cur_gi_entry->next == NULL) {
-		free(cur_gi_entry);
-		cur_gi_entry = NULL;
 
-	} else {
-		gw_info_entry *next_gi_entry = cur_gi_entry->next;
-		memcpy(cur_gi_entry, next_gi_entry, sizeof(gw_info_entry));
-		cur_gi_entry->next = next_gi_entry->next;
-		free(next_gi_entry);
-	}
-}
 
 /**
  * count how many route entry should send through specific interface
@@ -623,10 +594,13 @@ rip_packet *prepare_rip_packet(interface *cif, int type, int *rte_num)
         return NULL;
     }
     memset(rp, 0, rip_packet_size);
-    rp->command = RIP_RESPONSE;
-    rp->version = RIP_VERSION;
-    rp->pad1 = 0;
-    rp->pad2 = 0;
+    // rp->command = RIP_RESPONSE;
+    // rp->version = RIP_VERSION;
+    // rp->pad1 = 0;
+    // rp->pad2 = 0;
+    
+    rp->send_time = time(NULL);
+    rp->rtt = m_advp->gw_info->rtt;
     //not forget to cast rp to char* or the pointer will 
     //forward sizeof(rip_packet) * sizeof(rip_packet)
     //not just sizeof(rip_packet)
@@ -672,6 +646,7 @@ void send_rip_packet(rip_packet *rp, int rte_num, interface *cif)
 }
 
 /**
+ * judge whether the gateway info is worth to insert into gateway info list
  * walk through the rtes in the rip packet
  * judge whether each rte is worth to insert into the route entry list
  * @param rte_num rte count in the rip packet
@@ -679,6 +654,24 @@ void send_rip_packet(rip_packet *rp, int rte_num, interface *cif)
 void process_rip_packet(rip_packet *rp, int rte_num, interface* recvif, in_addr_t sender_ip) 
 {
 	debug("enter process_rip_packet");
+
+	//judge the gw info residing in the rip packet header
+	time_t now = time(NULL);
+	uint16_t rtt = now - rp->send_time + rp->rtt;
+	//better gateway
+	pthread_mutex_lock(&(m_advp->gw_info->gw_info_lock));
+	if (sender_ip == m_advp->gw_info->gw_ip) {
+		m_advp->gw_info->rtt = rtt;
+		m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+	} else {
+		if (rtt < m_advp->gw_info->rtt) {
+			m_advp->gw_info->rtt = rtt;
+			m_advp->gw_info->gw_ip = sender_ip;
+			m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+		}
+	}
+	pthread_mutex_unlock(&(m_advp->gw_info->gw_info_lock));
+	//check earch rip route entry
 	rte *r = (rte*)((char*)rp + sizeof(rip_packet));
 	int i;
 	for (i = 0; i < rte_num; i++) {
@@ -850,12 +843,6 @@ void process_time_event()
 		m_advp->update_send_timer = cur_time + ROUTE_UPDATE_INTERVAL;
 	}
 
-	if (m_advp->gw_update_timer <= cur_time) {
-		pthread_mutex_lock(&(m_advp->gi_list->gw_info_lock));
-		printf("avg rtt = %f\n", m_advp->gi_list->own_gw->rtt);
-		pthread_mutex_unlock(&(m_advp->gi_list->gw_info_lock));
-		m_advp->gw_update_timer = cur_time + GW_UPATE_INTERVAL;
-	}
 
 	//2. check expire_timer and holddown_timer in route_entry, 
 	//if expore_timer timeout change flag to INVALID_ROUTE_ENTRY, delete 
@@ -863,7 +850,7 @@ void process_time_event()
 	check_route_list();
 	//3. traverse the route entry list and print each route entry
 	//print_re_list();
-	check_gi_list();
+	check_gw_info();
 }
 
 /**
@@ -909,19 +896,17 @@ void check_route_list()
 	}
 }
 
-void check_gi_list()
+void check_gw_info()
 {
-	gw_info_list *gi_list = m_advp->gi_list;
-	pthread_mutex_lock(&(gi_list->gw_info_lock));
-	gw_info_entry *gi_entry = gi_list->gw_info_head;
-
-	while (gi_entry != NULL) {
-		if (gi_entry->type == NONLOCAL_GI_ENTRY && gi_entry->expire_timer <= time(NULL)) {
-			gi_list_delete(gi_entry);
-		}
-		gi_entry = gi_entry->next;
+	pthread_mutex_lock(&(m_advp->gw_info->gw_info_lock));
+	if (m_advp->gw_info->expire_timer <= time(NULL)) {
+		log_info("gateway expired");
+		m_advp->gw_info->rtt = 5;
 	}
-	pthread_mutex_unlock(&(gi_list->gw_info_lock));
+	char ip[IP_STR_LEN];
+	ip_to_str(m_advp->gw_info->gw_ip, ip);
+	log_info("Check gw info, rtt = %d, gw = %s", m_advp->gw_info->rtt, ip);
+	pthread_mutex_unlock(&(m_advp->gw_info->gw_info_lock));
 }
 
 /**
@@ -959,7 +944,7 @@ time_t search_nearest_timer()
 {
 	time_t shortest = m_advp->update_send_timer;
 	route_entry *re = m_advp->re_list_head;
-	gw_info_entry *gi_entry = m_advp->gi_list->gw_info_head;
+
 
 	debug("update timer = %ld", m_advp->update_send_timer);
 	while (re && re->type == NON_LOCAL_ROUTE_ENTRY) {
@@ -972,12 +957,9 @@ time_t search_nearest_timer()
 		}
 		re = re->next;
 	}
-
-	while (gi_entry && gi_entry->type == NONLOCAL_GI_ENTRY) {
-		if (gi_entry->expire_timer < shortest)
-			shortest = gi_entry->expire_timer;
-		gi_entry = gi_entry->next;
-	}
+	
+	if (m_advp->gw_info->expire_timer < shortest)
+		shortest = m_advp->gw_info->expire_timer;
 
 	return shortest;
 }
@@ -988,7 +970,7 @@ int create_detection_thread()
 	pthread_t detection_thread;
 	int rv;
 	rv = pthread_create(&detection_thread, NULL, 
-		start_detection_service, (void*)m_advp->gi_list);
+		start_detection_service, (void*)m_advp->gw_info);
    	
    	if (rv != 0) {
    		
@@ -1050,7 +1032,7 @@ void start_route_service()
 int main(int argc, char const *argv[])
 {
 
-	assert(sizeof(rip_packet) == 4);
+	assert(sizeof(rip_packet) == 6);
 	assert(sizeof(rte) == 18);
 
 	const char *active_ifs[MAX_IF_NUM];

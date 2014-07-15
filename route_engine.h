@@ -35,10 +35,16 @@ typedef struct rte {
 
 //RIP2 packet
 typedef struct rip_packet {
-	uint8_t command;
-	uint8_t version;
-	uint8_t pad1;
-	uint8_t pad2;
+	// uint8_t command;
+	// uint8_t version;
+	// uint8_t pad1;
+	// uint8_t pad2;
+	// uint8_t hop_count;
+	// uint8_t rtt;
+	// uint8_t payload;
+	// uint8_t sat_sigal;
+	uint32_t send_time;
+	uint16_t rtt;
 	rte routes[0];
 } rip_packet;
 
@@ -67,32 +73,20 @@ typedef struct route_entry {
 	struct route_entry *next;
 } route_entry;
 
-typedef struct gw_info_entry {
-	in_addr_t ip;
-	uint8_t hop_count;
-	double rtt;
-	double payload;
-	uint8_t sat_sigal;
-	uint8_t type;
-	time_t expire_timer;
-	struct gw_info_entry *next;
-
-} gw_info_entry;
-
-typedef struct gw_info_list {
-	gw_info_entry *gw_info_head;
-	pthread_mutex_t gw_info_lock;
-	gw_info_entry *best_gw;
-	gw_info_entry *own_gw;
+typedef struct gateway_info {
+	in_addr_t gw_ip;
 	in_addr_t ping_ip;
-} gw_info_list;
+	uint16_t rtt;
+	time_t expire_timer;
+	pthread_mutex_t gw_info_lock;
+} gateway_info;
+
 
 typedef struct advp {
 	time_t update_send_timer;
-	time_t gw_update_timer;
 	interface *if_list_head;
 	route_entry *re_list_head;
-	gw_info_list *gi_list;
+	gateway_info *gw_info;
 
 } advp;
 

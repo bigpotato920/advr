@@ -14,6 +14,7 @@
 #include <sys/epoll.h>
 #include <time.h>
 #include <pthread.h>
+#include <math.h>
 
 #include "log.h"
 #include "route_engine.h"
@@ -21,7 +22,8 @@
 #define MAX_EPOLL_EVENTS 1
 #define MAX_PACKET_NUM 6
 #define DATA_LENGTH 56
-
+#define GW_EXPIRE_INTERVAL 60
+#define DEFAULT_GW "10.103.240.200"
 int sockfd;
 
 struct sockaddr_in dest_addr;
@@ -127,7 +129,7 @@ int unpack(char *buf,int len)
     return -1;
 }
 
-double average_rtt()
+int average_rtt()
 {
     int i;
     double sum = 0.0;
@@ -135,10 +137,10 @@ double average_rtt()
         sum += total_rtt[i];
     }
 
-    return sum / MAX_PACKET_NUM;
+    return (int)round(sum / MAX_PACKET_NUM);
 }
 
-int start_service(int sockfd, gw_info_list *gi_list)
+int start_service(int sockfd, gateway_info *gw_info)
 {
     int efd;
     int res;
@@ -152,10 +154,10 @@ int start_service(int sockfd, gw_info_list *gi_list)
     res = epoll_ctl(efd, EPOLL_CTL_ADD, sockfd, &event);
 
     events = (struct epoll_event*)calloc(MAX_EPOLL_EVENTS, sizeof(event));
-    int timeout = 30 * 1000;
+    int timeout = 1 * 1000;
     int packet_send = 0;
     time_t init_time;
-    double avg_rtt;
+    int avg_rtt;
     while (1) {
         init_time = time(NULL);
         res  = epoll_wait(efd, events, MAX_EPOLL_EVENTS, timeout);
@@ -175,10 +177,20 @@ int start_service(int sockfd, gw_info_list *gi_list)
 
                 int i;
                 avg_rtt = average_rtt();
-                printf("average RTT is %f\n", avg_rtt);
-                pthread_mutex_lock(&(gi_list->gw_info_lock));
-                gi_list->own_gw->rtt = avg_rtt;
-                pthread_mutex_unlock(&(gi_list->gw_info_lock));
+                printf("average RTT is %d\n", avg_rtt);
+                pthread_mutex_lock(&(gw_info->gw_info_lock));
+                if (gw_info->gw_ip == inet_addr(DEFAULT_GW )) {
+                    gw_info->rtt = avg_rtt;
+                    gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+                } else {
+                    if (avg_rtt < gw_info->rtt) {
+                        gw_info->rtt = avg_rtt;
+                        gw_info->gw_ip = inet_addr(DEFAULT_GW);
+                        gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+                    }
+                }
+ 
+                pthread_mutex_unlock(&(gw_info->gw_info_lock));
                 for (i = 0; i < MAX_PACKET_NUM; i++) {
                     total_rtt[i] = 5000.0;
                 }
@@ -235,7 +247,7 @@ void *start_detection_service(void *arg)
 {
     int sockfd;
 
-    gw_info_list *gi_list = (gw_info_list*)arg;
+    gateway_info *gi_list = (gateway_info*)arg;
 
     sockfd = init_3g_detector(gi_list->ping_ip);
     start_service(sockfd, gi_list);
