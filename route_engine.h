@@ -76,6 +76,7 @@ typedef struct route_entry {
 typedef struct gateway_info {
 	in_addr_t gw_ip;
 	in_addr_t ping_ip;
+	in_addr_t netmask;
 	uint16_t rtt;
 	time_t expire_timer;
 	pthread_mutex_t gw_info_lock;
