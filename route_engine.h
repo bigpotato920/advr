@@ -75,6 +75,7 @@ typedef struct route_entry {
 
 typedef struct gateway_info {
 	char ping_if[IFNAMSIZ];
+	uint8_t ping_if_status;
 	in_addr_t ping_gw_ip;
 	in_addr_t ping_ip;
 	in_addr_t netmask;
