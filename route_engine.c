@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <pthread.h>
+#include <libconfig.h>
 
 #include "log.h"
 #include "route_engine.h"
@@ -69,9 +70,10 @@ void print_rip_packet(rip_packet *packet, int rte_num) ;
 
 
 int init_system();
-int init_ifs(const char **active_ifs, int n);
+int init_ifs(config_setting_t *if_setting);
+int init_gateway(config_setting_t *gw_setting);
 int add_local_rtes();
-int get_if_info(interface *cif);
+int set_if_info(interface *cif);
 void get_broadcast(interface * cif);
 int set_if_fds(interface *cif);
 int sendto_if(interface *cif, rip_packet *rp, int size);
@@ -192,6 +194,19 @@ void print_rip_packet(rip_packet *packet, int rte_num)
  */
 int init_system()
 {
+	//read configuration file
+	int res;
+	config_t cfg;
+	config_setting_t *setting;
+
+	config_init(&cfg);
+	if (!config_read_file(&cfg, "mconfig.cfg"))
+	{
+		fprintf(stderr, "%s:%d - %s\n", config_error_file(&cfg),
+		        config_error_line(&cfg), config_error_text(&cfg));
+		config_destroy(&cfg);
+		return(EXIT_FAILURE);
+	}
 
 	m_advp = (advp*)malloc(sizeof(advp));
 	if (m_advp == NULL) {
@@ -202,19 +217,21 @@ int init_system()
 	m_advp->if_list_head = NULL;
 	m_advp->re_list_head = NULL;
 
-	m_advp->gw_info = (gateway_info*)malloc(sizeof(gateway_info));
-
-	m_advp->gw_info->gw_ip = inet_addr(DAFAULT_GW);
-	m_advp->gw_info->rtt = 5;
-	m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
-
-	if (pthread_mutex_init(&m_advp->gw_info->gw_info_lock, NULL) != 0) {
-		log_err("Failed to initialize gi list's lock");
-		free(m_advp->gw_info);
-		return -1;
+	setting = config_lookup(&cfg, "advp.interfaces");
+	res = init_ifs(setting);
+	if (res == -1) {
+		log_err("Failed to initialize all the interfaces");
+		exit(EXIT_FAILURE);
 	}
 
-	m_advp->gw_info->ping_ip = inet_addr("222.128.13.159");
+	m_advp->gw_info = (gateway_info*)malloc(sizeof(gateway_info));
+	setting = config_lookup(&cfg, "advp.gateway");
+	res = init_gateway(setting);
+	if (res == -1) {
+		log_err("Failed to initialize gateway");
+		exit(EXIT_FAILURE);
+	}
+	
 	return 0;
 }
 
@@ -224,52 +241,58 @@ int init_system()
  * @param active_ifs name of the active network interface
  * @return 0 on success or -1 on failure
  */
-int init_ifs(const char **active_ifs, int n)
+int init_ifs(config_setting_t *if_setting)
 {
-	int ifindex;
-	char ifname[IFNAMSIZ];
+
 	interface *cur_if = NULL;
-    int i;
 
+	if (if_setting) {
+		int count = config_setting_length(if_setting);
+		int i;
+		printf("%-30s %-30s %-30s %-30s\n", "IF_NAME", "IP", "NETMASK", "ACTIVE");
+		for (i = 0; i < count; i++) {
+			config_setting_t *conf_if = config_setting_get_elem(if_setting, i);
+			const char *if_name = NULL;
+			const char *ip = NULL;
+			const char *netmask = NULL;
 
+			int active = 0;
+			if (!(config_setting_lookup_string(conf_if, "if_name", &if_name)
+				&& config_setting_lookup_string(conf_if, "ip", &ip)
+				&& config_setting_lookup_string(conf_if, "netmask", &netmask)
+				&& config_setting_lookup_int(conf_if, "active", &active)))
+				continue;
+			printf("%-30s %-30s %-30s %-30d\n", if_name, ip, netmask, active);
 
-	for (ifindex = 1; if_indextoname(ifindex, ifname) != 0; ifindex++) {
-		
-		cur_if = (interface*)malloc(sizeof(interface));
-		if (cur_if == NULL) {
-			log_err("Failed to create interface:%s", ifname);
-			return -1;
-		}
+			cur_if = (interface*)malloc(sizeof(interface));
+			if (cur_if == NULL) {
+				log_err("Failed to create interface:%s", if_name);
+				return -1;
+			}
 
-		strcpy(cur_if->ifname, ifname);
+			strcpy(cur_if->ifname, if_name);
+			cur_if->active = active;
+			cur_if->ifnumber = if_nametoindex(if_name);
+			cur_if->ip = inet_addr(ip);
+			cur_if->mask = inet_addr(netmask);
+			cur_if->network = cur_if->ip & cur_if->mask;
 
+			get_broadcast(cur_if);
 
-		cur_if->ifnumber = ifindex;
-		cur_if->active = 0;
-		for (i = 0; i < n; i++) {
-			debug("ifname = %s, active[%d] = %s", ifname, i, active_ifs[i]);
-			if (strcmp(ifname, active_ifs[i]) == 0) {
-				cur_if->active = 1;
-				log_info("Found active network interface:%s", cur_if->ifname);
-				break;
+			set_if_info(cur_if);
+			if (set_if_fds(cur_if) == -1)
+				return -1;
+			//insert the current interface to the head of the list
+			if (m_advp->if_list_head == NULL) {
+
+				m_advp->if_list_head = cur_if;
+				cur_if->next = NULL;
+
+			} else {
+				cur_if->next = m_advp->if_list_head;
+				m_advp->if_list_head = cur_if;
 			}
 		}
-
-		if (get_if_info(cur_if) == -1) {
-			free(cur_if);
-			continue;
-		}
-		//insert the current interface to the head of the list
-		if (m_advp->if_list_head == NULL) {
-
-			m_advp->if_list_head = cur_if;
-			cur_if->next = NULL;
-
-		} else {
-			cur_if->next = m_advp->if_list_head;
-			m_advp->if_list_head = cur_if;
-		}
-		
 	}
 
 	cur_if = m_advp->if_list_head;
@@ -285,59 +308,46 @@ int init_ifs(const char **active_ifs, int n)
  * @param  cif name of the current network interface
  * @return     0 on success or -1 on failure
  */
-int get_if_info(interface *cif)
-{
-	struct ifreq ifreq;
-	int fd;
-	struct sockaddr_in * address = (struct sockaddr_in *) &ifreq.ifr_addr;
+ int set_if_info(interface *cif)
+ {
+ 	struct ifreq ifr;
+ 	int fd;
+ 	struct sockaddr_in address;
 
-	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-	strncpy(ifreq.ifr_name, cif->ifname, sizeof(ifreq.ifr_name));
+ 	fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+ 	strncpy(ifr.ifr_name, cif->ifname, sizeof(ifr.ifr_name));
 
-	/* Check if this interface has broadcasting enabled */
-	log_info("Sending ioctls for interface: %s.", ifreq.ifr_name);
-	if ((ioctl(fd, SIOCGIFFLAGS, &ifreq)) == -1) {
-		log_err("Couldn't get interface flags.");
-		return -1;
-	} else {
-		log_info("Flags received: %d.", ifreq.ifr_flags);
-	}
+ 	address.sin_family = AF_INET;
+ 	address.sin_addr.s_addr = cif->ip;
+ 	memcpy(&ifr.ifr_addr, &address, sizeof(struct sockaddr));
+ 	
+ 	if (ioctl(fd, SIOCSIFADDR, &ifr) < 0) {
+ 		log_err("Failed to set %s's ip address", cif->ifname);
+ 		return -1;
+ 	}
 
-	/* IFF_BROADCAST is in linux/if.h */
-	if ((ifreq.ifr_flags & IFF_BROADCAST) == IFF_BROADCAST) {
-		log_info("Broadcast is enabled on interface %s.",
-		    cif->ifname);
-	} else {
-		log_info("Broadcast is NOT enabled on interface %s.",
-		    cif->ifname);
-		close(fd);
-		return -1;
-	}
+ 	address.sin_addr.s_addr = cif->mask;
+ 	memcpy(&ifr.ifr_addr, &address, sizeof(struct sockaddr));
 
-	/* Only attempt to get the broadcast address if broadcast
-	 * is enabled on this interface. */
-	if ((ioctl(fd, SIOCGIFADDR, &ifreq)) == -1) {
-		log_info("Couldn't get IP address.");
-		return -1;
-	} else {
-		cif->ip = address->sin_addr.s_addr;
-	}
+ 	if (ioctl(fd, SIOCSIFNETMASK, &ifr) < 0) {
+ 		log_err("Failed to set %s's netmask", cif->ifname);
+ 		close(fd);
+ 		return -1;
+ 	}
 
-	if ((ioctl(fd, SIOCGIFNETMASK, &ifreq)) == -1) {
-		log_info("Couldn't get network mask.");
-		return 0;
-	} else {
-		cif->mask = address->sin_addr.s_addr;
-	}
-	close(fd);
-
-	cif->network = cif->ip & cif->mask;
-	get_broadcast(cif);
-	if (set_if_fds(cif) == -1)
-		return -1;
-
-	return 0;
-}
+ 	if (!(ifr.ifr_flags & IFF_UP)) {
+ 		log_info("up interface :%s", cif->ifname);
+ 		ifr.ifr_flags |= IFF_UP;
+ 		if (ioctl(fd, SIOCSIFFLAGS, &ifr) < 0) {
+ 			log_err("Failed to up %s", cif->ifname);
+ 			close(fd);
+ 			return -1;
+ 		}
+ 	}
+ 	
+ 	close(fd);
+ 	return 0;
+ }
 
 /**
  * get broadcast infomation about specific network interface
@@ -408,6 +418,53 @@ int set_if_fds(interface *cif)
 	return 0;
 }
 
+int init_gateway(config_setting_t *gw_setting)
+{
+	const char *if_name = NULL;
+	const char *gw_ip = NULL;
+	const char *ping_ip = NULL;
+	const char *netmask = NULL;
+	int res;
+
+	if (!(config_setting_lookup_string(gw_setting, "if_name", &if_name)
+		&&config_setting_lookup_string(gw_setting, "ping_ip", &ping_ip)
+		&&config_setting_lookup_string(gw_setting, "gw_ip", &gw_ip)
+		&&config_setting_lookup_string(gw_setting, "netmask", &netmask))) {
+		return -1;
+	}
+	m_advp->gw_info->gw_ip = inet_addr(gw_ip);
+	m_advp->gw_info->rtt = 5;
+	m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+
+	if (pthread_mutex_init(&m_advp->gw_info->gw_info_lock, NULL) != 0) {
+		log_err("Failed to initialize gi list's lock");
+		free(m_advp->gw_info);
+		return -1;
+	}
+
+	m_advp->gw_info->ping_ip = inet_addr(ping_ip);	
+	m_advp->gw_info->netmask = inet_addr(netmask);
+
+	//add gateway route entry
+	route_entry re;
+	interface cif;
+
+	cif.ifnumber = if_nametoindex(if_name);
+	re.recvif = &cif;
+	re.dst = m_advp->gw_info->ping_ip;
+	re.gateway = m_advp->gw_info->gw_ip;
+	re.netmask = m_advp->gw_info->netmask;
+	re.metric = 1;
+
+	res = kernel_route(ROUTE_ADD, &re, NULL);
+	if (res < 0) {
+		log_err("Failed to add gateway route entry");
+		return -1;
+	}
+	printf("%-30s %-30s\n", ping_ip, gw_ip);
+
+	return 0;
+}
 /**
  * add local route entries to the route_entry list
  * set the type to LOCAL_ROUTE_ENTRY, so the entry won't be expired
@@ -902,6 +959,7 @@ void check_gw_info()
 	if (m_advp->gw_info->expire_timer <= time(NULL)) {
 		log_info("gateway expired");
 		m_advp->gw_info->rtt = 5;
+		m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
 	}
 	char ip[IP_STR_LEN];
 	ip_to_str(m_advp->gw_info->gw_ip, ip);
@@ -1034,29 +1092,14 @@ int main(int argc, char const *argv[])
 
 	assert(sizeof(rip_packet) == 6);
 	assert(sizeof(rte) == 18);
-
-	const char *active_ifs[MAX_IF_NUM];
 	int res;
-	int i;
-	if (argc < 2) {
-		printf("Usage:%s eth0\n", argv[0]);
-		exit(EXIT_FAILURE);
-	}
-	for (i = 1; i < argc; i++) {
-		active_ifs[i-1] = argv[i];
-		debug("active interface:%s", active_ifs[i-1]);
-	}
 
 	res = init_system();
 	if (res == -1) {
 		log_err("Failed to initialize system variables");
 		exit(EXIT_FAILURE);
 	}
-	res = init_ifs(active_ifs, argc -1);
-	if (res == -1) {
-		log_err("Failed to initialize all the interfaces");
-		exit(EXIT_FAILURE);
-	}
+
 	res = add_local_rtes();
 	if (res == -1) {
 		log_err("Failed to add local route entries");
