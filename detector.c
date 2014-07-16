@@ -14,13 +14,13 @@
 #include <sys/epoll.h>
 #include <time.h>
 #include <pthread.h>
-#include <math.h>
+#include <assert.h>
 
 #include "log.h"
 #include "route_engine.h"
 #define PACKET_SIZE 4096
 #define MAX_EPOLL_EVENTS 1
-#define MAX_PACKET_NUM 6
+#define MAX_PACKET_NUM 5
 #define DATA_LENGTH 56
 #define GW_EXPIRE_INTERVAL 60
 #define DEFAULT_GW "10.103.240.200"
@@ -135,9 +135,10 @@ int average_rtt()
     double sum = 0.0;
     for (i = 0; i < MAX_PACKET_NUM; i++) {
         sum += total_rtt[i];
+        printf("total_rtt[%d] = %lf\n", i, total_rtt[i]);
     }
 
-    return (int)round(sum / MAX_PACKET_NUM);
+    return (int)(sum / MAX_PACKET_NUM + 0.5);
 }
 
 int start_service(int sockfd, gateway_info *gw_info)
@@ -172,20 +173,20 @@ int start_service(int sockfd, gateway_info *gw_info)
                 }
                 packet_send++;
                 timeout = 5 * 1000;
-            }
-            else {
+
+            } else {
 
                 int i;
                 avg_rtt = average_rtt();
                 printf("average RTT is %d\n", avg_rtt);
                 pthread_mutex_lock(&(gw_info->gw_info_lock));
-                if (gw_info->gw_ip == inet_addr(DEFAULT_GW )) {
+                if (gw_info->gw_ip == gw_info->gw_ip) {
                     gw_info->rtt = avg_rtt;
                     gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
                 } else {
                     if (avg_rtt < gw_info->rtt) {
                         gw_info->rtt = avg_rtt;
-                        gw_info->gw_ip = inet_addr(DEFAULT_GW);
+                        gw_info->gw_ip = gw_info->gw_ip;
                         gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
                     }
                 }
@@ -217,18 +218,10 @@ int start_service(int sockfd, gateway_info *gw_info)
 int init_3g_detector(in_addr_t ping_ip)
 {
     int sockfd;
-    struct protoent *protocol;
     int i;
 
-    
 
-    if((protocol = getprotobyname("icmp")) == NULL)
-    {
-        perror("getprotobyname");
-        return -1;
-    }
-
-    if((sockfd = socket(AF_INET,SOCK_RAW,protocol->p_proto)) < 0)
+    if((sockfd = socket(AF_INET,SOCK_RAW,IPPROTO_ICMP)) < 0)
     {
         perror("socket error");
         return -1;
@@ -238,8 +231,11 @@ int init_3g_detector(in_addr_t ping_ip)
     dest_addr.sin_family = AF_INET;     //套接字域是AF_INET(网络套接字)
     dest_addr.sin_addr.s_addr = ping_ip;
 
-    for (i = 0; i < MAX_PACKET_NUM; i++)
+    for (i = 0; i < MAX_PACKET_NUM; i++) {
+
         total_rtt[i] = 5000.0;
+        printf("total_rtt[%d] = %lf\n", i, total_rtt[i]);
+    }
     return sockfd;
 }
 
@@ -250,6 +246,8 @@ void *start_detection_service(void *arg)
     gateway_info *gi_list = (gateway_info*)arg;
 
     sockfd = init_3g_detector(gi_list->ping_ip);
+    assert(sockfd > 0);
+    log_info("sockfd = %d\n", sockfd);
     start_service(sockfd, gi_list);
     return (void*)0;
 }
