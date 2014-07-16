@@ -73,6 +73,7 @@ int init_system();
 int init_ifs(config_setting_t *if_setting);
 int init_gateway(config_setting_t *gw_setting);
 int add_local_rtes();
+int add_gw_re(gateway_info *gw_info);
 int set_if_info(interface *cif);
 void get_broadcast(interface * cif);
 int set_if_fds(interface *cif);
@@ -421,47 +422,36 @@ int set_if_fds(interface *cif)
 int init_gateway(config_setting_t *gw_setting)
 {
 	const char *if_name = NULL;
-	const char *gw_ip = NULL;
+	const char *ping_gw_ip = NULL;
 	const char *ping_ip = NULL;
 	const char *netmask = NULL;
 	int res;
 
 	if (!(config_setting_lookup_string(gw_setting, "if_name", &if_name)
 		&&config_setting_lookup_string(gw_setting, "ping_ip", &ping_ip)
-		&&config_setting_lookup_string(gw_setting, "gw_ip", &gw_ip)
+		&&config_setting_lookup_string(gw_setting, "ping_gw_ip", &ping_gw_ip)
 		&&config_setting_lookup_string(gw_setting, "netmask", &netmask))) {
 		return -1;
 	}
-	m_advp->gw_info->gw_ip = inet_addr(gw_ip);
+	strcpy(m_advp->gw_info->ping_if, if_name);
+	m_advp->gw_info->ping_ip = inet_addr(ping_ip);
+	m_advp->gw_info->netmask = inet_addr(netmask);
+	m_advp->gw_info->ping_gw_ip = inet_addr(ping_gw_ip);
+	m_advp->gw_info->default_gw_ip = inet_addr(ping_gw_ip);
 	m_advp->gw_info->rtt = 5;
 	m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
-
+	
 	if (pthread_mutex_init(&m_advp->gw_info->gw_info_lock, NULL) != 0) {
 		log_err("Failed to initialize gi list's lock");
 		free(m_advp->gw_info);
 		return -1;
-	}
+	}	
 
-	m_advp->gw_info->ping_ip = inet_addr(ping_ip);	
-	m_advp->gw_info->netmask = inet_addr(netmask);
 
-	//add gateway route entry
-	route_entry re;
-	interface cif;
+	//add ping gateway route entry
+	res = add_gw_re(m_advp->gw_info);
 
-	cif.ifnumber = if_nametoindex(if_name);
-	re.recvif = &cif;
-	re.dst = m_advp->gw_info->ping_ip;
-	re.gateway = m_advp->gw_info->gw_ip;
-	re.netmask = m_advp->gw_info->netmask;
-	re.metric = 1;
-
-	res = kernel_route(ROUTE_ADD, &re, NULL);
-	if (res < 0) {
-		log_err("Failed to add gateway route entry");
-		return -1;
-	}
-	printf("%-30s %-30s\n", ping_ip, gw_ip);
+	printf("%-30s %-30s\n", ping_ip, ping_gw_ip);
 
 	return 0;
 }
@@ -512,6 +502,33 @@ int add_local_rtes()
 	return 0;
 }
 
+/**
+ * in order to send icmp packets through 3G router,we have to let
+ * the 3G router to be the gateway to the ping address.
+ * @param  gw_info gateway info structure
+ * @return         0 on success or -1 on failure
+ */
+int add_gw_re(gateway_info *gw_info)
+{
+	route_entry re;
+	interface cif;
+	int res;
+
+	cif.ifnumber = if_nametoindex(gw_info->ping_if);
+	re.recvif = &cif;
+	re.dst = m_advp->gw_info->ping_ip;
+	re.gateway = m_advp->gw_info->ping_gw_ip;
+	re.netmask = m_advp->gw_info->netmask;
+	re.metric = 1;
+
+	res = kernel_route(ROUTE_ADD, &re, NULL);
+	if (res < 0) {
+		log_err("Failed to add gateway route entry");
+		return -1;
+	}
+
+	return 0;
+}
 /**
  * add new route entry into the route entry list
  * @param  r rip route entry in rip packet
@@ -717,13 +734,13 @@ void process_rip_packet(rip_packet *rp, int rte_num, interface* recvif, in_addr_
 	uint16_t rtt = now - rp->send_time + rp->rtt;
 	//better gateway
 	pthread_mutex_lock(&(m_advp->gw_info->gw_info_lock));
-	if (sender_ip == m_advp->gw_info->gw_ip) {
+	if (sender_ip == m_advp->gw_info->default_gw_ip) {
 		m_advp->gw_info->rtt = rtt;
 		m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
 	} else {
 		if (rtt < m_advp->gw_info->rtt) {
 			m_advp->gw_info->rtt = rtt;
-			m_advp->gw_info->gw_ip = sender_ip;
+			m_advp->gw_info->default_gw_ip = sender_ip;
 			m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
 		}
 	}
@@ -962,7 +979,7 @@ void check_gw_info()
 		m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
 	}
 	char ip[IP_STR_LEN];
-	ip_to_str(m_advp->gw_info->gw_ip, ip);
+	ip_to_str(m_advp->gw_info->default_gw_ip, ip);
 	log_info("Check gw info, rtt = %d, gw = %s", m_advp->gw_info->rtt, ip);
 	pthread_mutex_unlock(&(m_advp->gw_info->gw_info_lock));
 }

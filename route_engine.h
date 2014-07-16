@@ -74,9 +74,11 @@ typedef struct route_entry {
 } route_entry;
 
 typedef struct gateway_info {
-	in_addr_t gw_ip;
+	char ping_if[IFNAMSIZ];
+	in_addr_t ping_gw_ip;
 	in_addr_t ping_ip;
 	in_addr_t netmask;
+	in_addr_t default_gw_ip;
 	uint16_t rtt;
 	time_t expire_timer;
 	pthread_mutex_t gw_info_lock;

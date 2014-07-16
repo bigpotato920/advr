@@ -180,13 +180,13 @@ int start_service(int sockfd, gateway_info *gw_info)
                 avg_rtt = average_rtt();
                 printf("average RTT is %d\n", avg_rtt);
                 pthread_mutex_lock(&(gw_info->gw_info_lock));
-                if (gw_info->gw_ip == gw_info->gw_ip) {
+                if (gw_info->ping_gw_ip == gw_info->default_gw_ip) {
                     gw_info->rtt = avg_rtt;
                     gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
                 } else {
                     if (avg_rtt < gw_info->rtt) {
                         gw_info->rtt = avg_rtt;
-                        gw_info->gw_ip = gw_info->gw_ip;
+                        gw_info->default_gw_ip = gw_info->ping_gw_ip;
                         gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
                     }
                 }
