@@ -45,6 +45,9 @@
 #define INFINITY 16
 #define NOTUSED_TIMER -1
 
+#define IF_ONLINE 1
+#define IF_OFFLINE 0
+
 #define USUAL_UPDATE 0
 #define URGENT_UPDATE 1
 #define IP_STR_LEN 16
@@ -73,7 +76,7 @@ int init_system();
 int init_ifs(config_setting_t *if_setting);
 int init_gateway(config_setting_t *gw_setting);
 int add_local_rtes();
-int add_gw_re(gateway_info *gw_info);
+int add_gw_re();
 int set_if_info(interface *cif);
 void get_broadcast(interface * cif);
 int set_if_fds(interface *cif);
@@ -85,6 +88,7 @@ int process_upcoming_msg(void *data);
 void process_time_event();
 void check_route_list();
 void check_gw_info();
+void check_if_status();
 void process_rip_packet(rip_packet *rp, int rte_num, interface *recvif, in_addr_t sender_ip);
 void process_rte(rte *r, interface *recvif, in_addr_t sender_ip);
 int re_list_add(route_entry *new_re);
@@ -440,7 +444,7 @@ int init_gateway(config_setting_t *gw_setting)
 	m_advp->gw_info->default_gw_ip = inet_addr(ping_gw_ip);
 	m_advp->gw_info->rtt = 5;
 	m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
-	
+	m_advp->gw_info->ping_if_status = IF_ONLINE;
 	if (pthread_mutex_init(&m_advp->gw_info->gw_info_lock, NULL) != 0) {
 		log_err("Failed to initialize gi list's lock");
 		free(m_advp->gw_info);
@@ -449,7 +453,7 @@ int init_gateway(config_setting_t *gw_setting)
 
 
 	//add ping gateway route entry
-	res = add_gw_re(m_advp->gw_info);
+	res = add_gw_re();
 
 	printf("%-30s %-30s\n", ping_ip, ping_gw_ip);
 
@@ -503,17 +507,34 @@ int add_local_rtes()
 }
 
 /**
+ * check whether specific interface is online
+ * @param  name of the interface
+ * @return     0 on down or 1 on up
+ */
+int is_if_online(char *if_name)
+{
+	struct ifreq ifr;
+	int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+	memset(&ifr, 0, sizeof(ifr));
+	strcpy(ifr.ifr_name, if_name);
+	if (ioctl(sock, SIOCGIFFLAGS, &ifr) < 0) {
+	    perror("SIOCGIFFLAGS");
+	}
+	close(sock);
+	return (ifr.ifr_flags & IFF_UP);
+}
+/**
  * in order to send icmp packets through 3G router,we have to let
  * the 3G router to be the gateway to the ping address.
- * @param  gw_info gateway info structure
  * @return         0 on success or -1 on failure
  */
-int add_gw_re(gateway_info *gw_info)
+int add_gw_re()
 {
 	route_entry re;
 	interface cif;
 	int res;
 
+	gateway_info *gw_info = m_advp->gw_info;
 	cif.ifnumber = if_nametoindex(gw_info->ping_if);
 	re.recvif = &cif;
 	re.dst = m_advp->gw_info->ping_ip;
@@ -526,7 +547,7 @@ int add_gw_re(gateway_info *gw_info)
 		log_err("Failed to add gateway route entry");
 		return -1;
 	}
-
+	printf("add ping gaeway route entry\n");
 	return 0;
 }
 /**
@@ -847,7 +868,7 @@ void process_rte(rte *r, interface *recvif, in_addr_t sender_ip)
 }
 
 /**
- * broad cast route entry update message
+ * broadcast route entry update message
  */
 void broadcast_update_msg(int type)
 {
@@ -925,6 +946,10 @@ void process_time_event()
 	//3. traverse the route entry list and print each route entry
 	//print_re_list();
 	check_gw_info();
+
+	//check whether the 3G router interface is down to up
+	//if so add the ping gateway route entry
+	check_if_status();
 }
 
 /**
@@ -970,6 +995,9 @@ void check_route_list()
 	}
 }
 
+/**
+ * check wheter the gateway information is invalid
+ */
 void check_gw_info()
 {
 	pthread_mutex_lock(&(m_advp->gw_info->gw_info_lock));
@@ -984,6 +1012,26 @@ void check_gw_info()
 	pthread_mutex_unlock(&(m_advp->gw_info->gw_info_lock));
 }
 
+/**
+ * check whether the 3G router interface is down to up
+ * if so we should add the ping gateway route entry
+ * @param if_name name of the interface
+ */
+void check_if_status()
+{
+	printf("check if status\n");
+	char *if_name = m_advp->gw_info->ping_if;
+	if (is_if_online(if_name)) {
+		if (m_advp->gw_info->ping_if_status == IF_OFFLINE) {
+			m_advp->gw_info->ping_if_status = IF_ONLINE;
+			printf("%s is down to up\n", if_name);
+			add_gw_re();
+		}
+	} else {
+		m_advp->gw_info->ping_if_status = IF_OFFLINE;
+		printf("%s is offline\n", if_name);
+	}
+}
 /**
  * add various events to epoll
  * @param efd epool fd
