@@ -197,6 +197,8 @@ int kernel_route(int command, route_entry *re, route_entry *new_re)
 		struct nlmsgerr *err = (struct nlmsgerr *) NLMSG_DATA(h);
 		log_err("Kernel responded: %s.", strerror(-err->error));
 		close(fd);
+		if (errno == 0)
+			return 0;
 		return -1;
 	}
 	close(fd);
