@@ -1,7 +1,7 @@
 TARGET = arm_route_engine
 CC=arm-linux-gcc
 CFLAGS=-g -Wall
-LDFLAGS= -lpthread -lm
+LDFLAGS= -lpthread -lm -lconfig
 
 
 BIN_NAME = $(TARGET)
