@@ -23,7 +23,8 @@
 #define MAX_PACKET_NUM 5
 #define DATA_LENGTH 56
 #define GW_EXPIRE_INTERVAL 60
-#define DEFAULT_GW "10.103.240.200"
+#define MAX_RTT 5000
+
 int sockfd;
 
 struct sockaddr_in dest_addr;
@@ -233,7 +234,7 @@ int init_3g_detector(in_addr_t ping_ip)
 
     for (i = 0; i < MAX_PACKET_NUM; i++) {
 
-        total_rtt[i] = 5000.0;
+        total_rtt[i] = MAX_RTT;
         printf("total_rtt[%d] = %lf\n", i, total_rtt[i]);
     }
     return sockfd;
