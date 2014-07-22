@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include "hashmap.h"
 
 typedef struct interface {
 	char ifname[IFNAMSIZ];
@@ -67,19 +68,21 @@ typedef struct route_entry {
 	uint32_t flags;
 	time_t expire_timer;
 	time_t holddown_timer;
-	//on which interface the route entry come from
+	//on which interface the route entry comes from
 	//which will help to implement split horizon
-	interface *recvif;
+	int ifnumber;
+	time_t recv_time;
 	struct route_entry *next;
 } route_entry;
 
 typedef struct gateway_info {
 	char ping_if[IFNAMSIZ];
 	uint8_t ping_if_status;
-	in_addr_t ping_gw_ip;
 	in_addr_t ping_ip;
 	in_addr_t netmask;
+	in_addr_t ping_gw_ip;
 	in_addr_t default_gw_ip;
+	int default_gw_ifnumber;
 	uint16_t rtt;
 	time_t expire_timer;
 	pthread_mutex_t gw_info_lock;
@@ -90,8 +93,10 @@ typedef struct advp {
 	time_t update_send_timer;
 	interface *if_list_head;
 	route_entry *re_list_head;
+	route_entry *default_re;
 	gateway_info *gw_info;
-
+	hashmap *neighbor_hp;
 } advp;
 
+int modify_default_re(int ifnumber, in_addr_t sender_ip);
 #endif
