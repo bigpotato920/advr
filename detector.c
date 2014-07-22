@@ -15,6 +15,7 @@
 #include <time.h>
 #include <pthread.h>
 #include <assert.h>
+#include <net/if.h>
 
 #include "log.h"
 #include "route_engine.h"
@@ -35,17 +36,13 @@ pid_t pid;
 double total_rtt[MAX_PACKET_NUM];
 
 //两个timeval相减
-void tv_sub(struct timeval *recvtime,struct timeval *sendtime)
+static void tv_sub(struct timeval *out, struct timeval *in)
 {
-    long sec = recvtime->tv_sec - sendtime->tv_sec;
-    long usec = recvtime->tv_usec - sendtime->tv_usec;
-    if(usec >= 0){
-        recvtime->tv_sec = sec;
-        recvtime->tv_usec = usec;
-    }else{
-        recvtime->tv_sec = sec - 1;
-        recvtime->tv_usec = -usec;
+    if ((out->tv_usec -= in->tv_usec) < 0) {   /* out -= in */
+        --out->tv_sec;
+        out->tv_usec += 1000000;
     }
+    out->tv_sec -= in->tv_sec;
 }
 
 /****检验和算法****/
@@ -188,7 +185,10 @@ int start_service(int sockfd, gateway_info *gw_info)
                     if (avg_rtt < gw_info->rtt) {
                         gw_info->rtt = avg_rtt;
                         gw_info->default_gw_ip = gw_info->ping_gw_ip;
+                        gw_info->default_gw_ifnumber = if_nametoindex(gw_info->ping_if);
                         gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+
+                        modify_default_re(if_nametoindex(gw_info->ping_if), gw_info->ping_gw_ip);
                     }
                 }
  
