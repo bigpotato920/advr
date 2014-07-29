@@ -19,6 +19,7 @@
 
 #include "log.h"
 #include "route_engine.h"
+#include "detector.h"
 #define PACKET_SIZE 4096
 #define MAX_EPOLL_EVENTS 1
 #define MAX_PACKET_NUM 5
@@ -139,7 +140,7 @@ int average_rtt()
     return (int)(sum / MAX_PACKET_NUM + 0.5);
 }
 
-int start_service(int sockfd, gateway_info *gw_info)
+int start_service(int sockfd, tg_info *gw_info)
 {
     int efd;
     int res;
@@ -177,10 +178,11 @@ int start_service(int sockfd, gateway_info *gw_info)
                 int i;
                 avg_rtt = average_rtt();
                 printf("average RTT is %d\n", avg_rtt);
-                pthread_mutex_lock(&(gw_info->gw_info_lock));
+                pthread_mutex_lock(&(gw_info->tg_info_lock));
                 if (gw_info->ping_gw_ip == gw_info->default_gw_ip) {
                     gw_info->rtt = avg_rtt;
-                    gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+                    if (avg_rtt < MAX_RTT)
+                        gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
                 } else {
                     if (avg_rtt < gw_info->rtt) {
                         gw_info->rtt = avg_rtt;
@@ -192,7 +194,7 @@ int start_service(int sockfd, gateway_info *gw_info)
                     }
                 }
  
-                pthread_mutex_unlock(&(gw_info->gw_info_lock));
+                pthread_mutex_unlock(&(gw_info->tg_info_lock));
                 for (i = 0; i < MAX_PACKET_NUM; i++) {
                     total_rtt[i] = 5000.0;
                 }
@@ -244,7 +246,7 @@ void *start_detection_service(void *arg)
 {
     int sockfd;
 
-    gateway_info *gi_list = (gateway_info*)arg;
+    tg_info *gi_list = (tg_info*)arg;
 
     sockfd = init_3g_detector(gi_list->ping_ip);
     assert(sockfd > 0);
