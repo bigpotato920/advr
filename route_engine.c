@@ -20,12 +20,14 @@
 #include "route_engine.h"
 #include "kroute.h"
 #include "detector.h"
+#include "packet_sniffer.h"
+#include "iridium.h"
 
 #define ROUTE_UPDATE_INTERVAL 15
 #define EXPIRE_INTERVAL 30
 #define HODLDOWN_INTERVAL 15
 #define GW_UPATE_INTERVAL 30
-#define GW_EXPIRE_INTERVAL 60
+#define GW_EXPIRE_INTERVAL 30
 #define LOCAL_GI_ENTRY 0
 #define NONLOCAL_GI_ENTRY 1
 
@@ -61,7 +63,8 @@
 #define get_rip_packet_size(rte_num) (sizeof(rip_packet) + rte_num * sizeof(rte))
 
 
-#define DAFAULT_GW "10.103.240.200"
+#define DEFAULT_HASHMAP_ENTRY_COUNT 50
+#define MAX_RTT 5000
 //utility function
 int is_local_ip(in_addr_t ip);
 int ip_to_str(in_addr_t ip, char *str);
@@ -76,7 +79,8 @@ void print_rip_packet(rip_packet *packet, int rte_num) ;
 
 int init_system();
 int init_ifs(config_setting_t *if_setting);
-int init_gateway(config_setting_t *gw_setting);
+int init_tg(config_setting_t *tg_setting);
+int init_satellite(config_setting_t *satellite_setting);
 int add_local_rtes();
 int add_gw_re();
 int add_default_re();
@@ -90,10 +94,10 @@ rip_packet *prepare_rip_packet(interface *cif, int type, int *rte_num);
 int process_upcoming_msg(void *data);
 void process_time_event();
 void check_route_list();
-void check_gw_info();
+void check_tg_info();
 void check_if_status();
 void process_rip_packet(rip_packet *rp, int rte_num, interface *recvif, in_addr_t sender_ip);
-void process_gw_info(uint16_t rtt, int ifnumber, in_addr_t sender_ip);
+void process_tg_info(uint16_t rtt, int ifnumber, in_addr_t sender_ip);
 void process_rte(rte *r, interface *recvif, in_addr_t sender_ip);
 int re_list_add(route_entry *new_re);
 int re_list_delete(route_entry *re);
@@ -101,7 +105,7 @@ int re_list_modify(route_entry *old_re, route_entry *new_re);
 void copy_route_entry(route_entry *dst, route_entry *src);
 void start_route_service();
 int create_detection_thread();
-
+int create_iridium_thread();
 
 advp *m_advp = NULL;
 /**
@@ -239,15 +243,22 @@ int init_system()
 		exit(EXIT_FAILURE);
 	}
 
-	m_advp->gw_info = (gateway_info*)malloc(sizeof(gateway_info));
-	setting = config_lookup(&cfg, "advp.gateway");
-	res = init_gateway(setting);
+	
+	setting = config_lookup(&cfg, "advp.gateway.tg");
+	res = init_tg(setting);
 	if (res == -1) {
 		log_err("Failed to initialize gateway");
 		exit(EXIT_FAILURE);
 	}
+
+	setting = config_lookup(&cfg, "advp.gateway.satellite");
+	res = init_satellite(setting);
+	if (res == -1) {
+		log_err("Failed to initialize satellite");
+		exit(EXIT_FAILURE);
+	}
 	
-	m_advp->neighbor_hp = hashmap_new(50);
+	m_advp->neighbor_hp = hashmap_new(DEFAULT_HASHMAP_ENTRY_COUNT);
 	if (m_advp->neighbor_hp == NULL) {
 		log_err("Failed to initialize neighbor hashmap");
 		return -1;
@@ -439,7 +450,12 @@ int set_if_fds(interface *cif)
 	return 0;
 }
 
-int init_gateway(config_setting_t *gw_setting)
+/**
+ * initialize 3g specific infomation
+ * @param  m3g_setting 
+ * @return             0 on success or -1 on failure
+ */
+int init_tg(config_setting_t *m3g_setting)
 {
 	const char *if_name = NULL;
 	const char *ping_gw_ip = NULL;
@@ -447,32 +463,91 @@ int init_gateway(config_setting_t *gw_setting)
 	const char *netmask = NULL;
 	int res;
 
-	if (!(config_setting_lookup_string(gw_setting, "if_name", &if_name)
-		&&config_setting_lookup_string(gw_setting, "ping_ip", &ping_ip)
-		&&config_setting_lookup_string(gw_setting, "ping_gw_ip", &ping_gw_ip)
-		&&config_setting_lookup_string(gw_setting, "netmask", &netmask))) {
+	assert(m3g_setting != NULL);
+
+	m_advp->tg_info = (tg_info*)malloc(sizeof(tg_info));
+	if (m_advp->tg_info == NULL) {
+		log_err("Failed to create 3g info");
 		return -1;
 	}
-	strcpy(m_advp->gw_info->ping_if, if_name);
-	m_advp->gw_info->ping_ip = inet_addr(ping_ip);
-	m_advp->gw_info->netmask = inet_addr(netmask);
-	m_advp->gw_info->ping_gw_ip = inet_addr(ping_gw_ip);
-	m_advp->gw_info->default_gw_ip = inet_addr(ping_gw_ip);
-	m_advp->gw_info->rtt = 5000;
-	m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
-	m_advp->gw_info->ping_if_status = IF_ONLINE;
-	if (pthread_mutex_init(&m_advp->gw_info->gw_info_lock, NULL) != 0) {
+
+	if (!(config_setting_lookup_string(m3g_setting, "if_name", &if_name)
+		&&config_setting_lookup_string(m3g_setting, "ping_ip", &ping_ip)
+		&&config_setting_lookup_string(m3g_setting, "ping_gw_ip", &ping_gw_ip)
+		&&config_setting_lookup_string(m3g_setting, "netmask", &netmask))) {
+		return -1;
+	}
+	strcpy(m_advp->tg_info->ping_if, if_name);
+	m_advp->tg_info->ping_ip = inet_addr(ping_ip);
+	m_advp->tg_info->netmask = inet_addr(netmask);
+	m_advp->tg_info->ping_gw_ip = inet_addr(ping_gw_ip);
+	m_advp->tg_info->default_gw_ip = inet_addr(ping_gw_ip);
+	m_advp->tg_info->rtt = MAX_RTT;
+	m_advp->tg_info->expire_count = 0;
+	m_advp->tg_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+	m_advp->tg_info->ping_if_status = IF_ONLINE;
+	if (pthread_mutex_init(&m_advp->tg_info->tg_info_lock, NULL) != 0) {
 		log_err("Failed to initialize gi list's lock");
-		free(m_advp->gw_info);
+		free(m_advp->tg_info);
 		return -1;
 	}	
 
 
 	//add ping gateway route entry
 	res = add_gw_re();
+	//add the default gateway entry
 	res = add_default_re();
-	printf("%-30s %-30s\n", ping_ip, ping_gw_ip);
+	debug("%-30s %-30s\n", ping_ip, ping_gw_ip);
 
+	return res;
+}
+
+int init_satellite(config_setting_t *satellite_setting)
+{
+	int pcap_if_count = 0;
+	const char *if_name = NULL;
+	const char *rule = NULL;
+	int i;
+
+	assert(satellite_setting != NULL);
+
+	pcap_if_count = config_setting_length(satellite_setting);
+	assert(pcap_if_count > 0);
+	m_advp->sate_info = (sate_info*)malloc(sizeof(sate_info) + 
+		pcap_if_count * sizeof(sate_info_entry));
+	if (m_advp->sate_info == NULL) {
+		log_err("Failed to create satellite info");
+		return -1;
+	}
+
+	m_advp->sate_info->pcap_if_count = pcap_if_count;
+	m_advp->sate_info->running = 0;
+
+	debug("count = %d", pcap_if_count);
+	for (i = 0; i < pcap_if_count; i++) {
+		config_setting_t *pcap_if = config_setting_get_elem(satellite_setting, i);
+		if (!(config_setting_lookup_string(pcap_if, "if_name", &if_name)
+			&& config_setting_lookup_string(pcap_if, "rule", &rule))){
+			log_err("Failed to lookup name");
+			return -1;
+		}
+
+		strcpy(m_advp->sate_info->entries[i].interface, if_name);
+		strcpy(m_advp->sate_info->entries[i].rule, rule);
+	}
+
+	if (pipe(m_advp->sate_info->pipe_fds) < 0) {
+		log_err("Failed to create pipe");
+		return -1;
+	}
+
+	m_advp->sate_info->req_queue = queue_create();
+	if (m_advp->sate_info->req_queue == NULL) {
+		log_err("Failed to create request queue");
+		return -1;
+	}
+	pthread_mutex_init(&m_advp->sate_info->cond_mutex, NULL);
+	pthread_cond_init(&m_advp->sate_info->last_choice, NULL);
 	return 0;
 }
 /**
@@ -549,11 +624,11 @@ int add_gw_re()
 	route_entry re;
 	int res;
 
-	gateway_info *gw_info = m_advp->gw_info;
-	re.ifnumber = if_nametoindex(gw_info->ping_if);
-	re.dst = m_advp->gw_info->ping_ip;
-	re.gateway = m_advp->gw_info->ping_gw_ip;
-	re.netmask = m_advp->gw_info->netmask;
+	tg_info *tg_info = m_advp->tg_info;
+	re.ifnumber = if_nametoindex(tg_info->ping_if);
+	re.dst = m_advp->tg_info->ping_ip;
+	re.gateway = m_advp->tg_info->ping_gw_ip;
+	re.netmask = m_advp->tg_info->netmask;
 	re.metric = 1;
 
 	res = kernel_route(ROUTE_ADD, &re, NULL);
@@ -561,7 +636,7 @@ int add_gw_re()
 		log_err("Failed to add gateway route entry");
 		return -1;
 	}
-	printf("add ping gateway route entry\n");
+	log_info("add ping gateway route entry");
 	return 0;
 }
 
@@ -585,10 +660,10 @@ int add_default_re()
 	}
 
 	int res;
-	re->ifnumber  = if_nametoindex(m_advp->gw_info->ping_if);
+	re->ifnumber  = if_nametoindex(m_advp->tg_info->ping_if);
 	re->dst = 0;
 	re->netmask = 0;
-	re->gateway = m_advp->gw_info->ping_gw_ip;
+	re->gateway = m_advp->tg_info->ping_gw_ip;
 	re->metric = 0;
 
 	res = kernel_route(ROUTE_ADD, re, NULL);
@@ -615,10 +690,10 @@ int modify_default_re(int ifnumber, in_addr_t sender_ip)
 	new_re->ifnumber = ifnumber;
 	new_re->dst = 0;
 	new_re->netmask = 0;
-	new_re->gateway = m_advp->gw_info->default_gw_ip;
+	new_re->gateway = m_advp->tg_info->default_gw_ip;
 	new_re->metric = 0;
 
-	assert(sender_ip == m_advp->gw_info->default_gw_ip);
+	assert(sender_ip == m_advp->tg_info->default_gw_ip);
 
 	res = kernel_route(ROUTE_MOD, m_advp->default_re, new_re);
 
@@ -700,9 +775,9 @@ int re_list_modify(route_entry *old_re, route_entry *new_re)
 
 
 /**
- * count how many route entry should send through specific interface
+ * count how many route entries should be send through specific interface
  * @param  cif which interface to send to
- * @return     num of route entry
+ * @return     num of route entries
  */
 int count_re4if(interface *cif)
 {
@@ -772,14 +847,13 @@ rip_packet *prepare_rip_packet(interface *cif, int type, int *rte_num)
     // rp->pad1 = 0;
     // rp->pad2 = 0;
     
-    rp->send_time = time(NULL);
     //poison reverse
-    if (cif->ifnumber == m_advp->gw_info->default_gw_ifnumber)
-    	rp->rtt = 5000;
+    if (cif->ifnumber == m_advp->tg_info->default_gw_ifnumber)
+    	rp->rtt = MAX_RTT;
     else {
-    	pthread_mutex_lock(&(m_advp->gw_info->gw_info_lock));
-    	rp->rtt = m_advp->gw_info->rtt;
-    	pthread_mutex_unlock(&(m_advp->gw_info->gw_info_lock));
+    	pthread_mutex_lock(&(m_advp->tg_info->tg_info_lock));
+    	rp->rtt = m_advp->tg_info->rtt;
+    	pthread_mutex_unlock(&(m_advp->tg_info->tg_info_lock));
     }
   
     //dont forget to cast rp to char* or the pointer will 
@@ -797,7 +871,6 @@ rip_packet *prepare_rip_packet(interface *cif, int type, int *rte_num)
 			cur_r->netmask = re->netmask;
 			cur_r->gateway = re->gateway;
 			cur_r->metric = re->metric;
-			//print_rte(cur_r);
 			cur_r++;
 		}
 
@@ -827,7 +900,7 @@ void send_rip_packet(rip_packet *rp, int rte_num, interface *cif)
 }
 
 /**
- * judge whether the gateway info is worth to insert into gateway info list
+ * judge whether it is worth to change default gateway
  * walk through the rtes in the rip packet
  * judge whether each rte is worth to insert into the route entry list
  * @param rte_num rte count in the rip packet
@@ -836,7 +909,7 @@ void process_rip_packet(rip_packet *rp, int rte_num, interface* recvif, in_addr_
 {
 	debug("enter process_rip_packet");
 
-	process_gw_info(rp->rtt, recvif->ifnumber, sender_ip);
+	process_tg_info(rp->rtt, recvif->ifnumber, sender_ip);
 	//check earch rip route entry
 	rte *r = (rte*)((char*)rp + sizeof(rip_packet));
 	int i;
@@ -870,7 +943,7 @@ int compute_link_qty(in_addr_t sender_ip)
 	gettimeofday(&cur, NULL);
 	if (hashmap_search(m_advp->neighbor_hp, sender_ip) == NULL) {
 		hashmap_put(m_advp->neighbor_hp, sender_ip, &cur, sizeof(struct timeval));
-		return 5000;
+		return MAX_RTT;
 	}
 
 	hashmap_get(m_advp->neighbor_hp, sender_ip, &last, sizeof(struct timeval));
@@ -895,30 +968,30 @@ int compute_link_qty(in_addr_t sender_ip)
 	return interval - SECOND_TO_MILLSECOND(ROUTE_UPDATE_INTERVAL);
 }
 
-void process_gw_info(uint16_t rtt, int ifnumber, in_addr_t sender_ip)
+void process_tg_info(uint16_t rtt, int ifnumber, in_addr_t sender_ip)
 {
 	log_info("receive rtt = %d\n", rtt);
 
 	int link_qty = compute_link_qty(sender_ip);
 	log_info("link qty = %d", link_qty);
-	pthread_mutex_lock(&(m_advp->gw_info->gw_info_lock));
+	pthread_mutex_lock(&(m_advp->tg_info->tg_info_lock));
 
-	if (sender_ip == m_advp->gw_info->default_gw_ip) {
-		m_advp->gw_info->rtt = rtt + 2 * link_qty;
-		m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+	if (sender_ip == m_advp->tg_info->default_gw_ip) {
+		m_advp->tg_info->rtt = rtt + 2 * link_qty;
+		m_advp->tg_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
 	} else {
 		//better gateway
-		if (rtt + 2 * link_qty < m_advp->gw_info->rtt) {
+		if (rtt + 2 * link_qty < m_advp->tg_info->rtt) {
 			debug("a better gateway:rtt = %d\n", rtt + 2 * link_qty);
-			m_advp->gw_info->rtt = rtt + 2 * link_qty;
-			m_advp->gw_info->default_gw_ip = sender_ip;
-			m_advp->gw_info->default_gw_ifnumber = ifnumber;
-			m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+			m_advp->tg_info->rtt = rtt + 2 * link_qty;
+			m_advp->tg_info->default_gw_ip = sender_ip;
+			m_advp->tg_info->default_gw_ifnumber = ifnumber;
+			m_advp->tg_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
 			
 			modify_default_re(ifnumber, sender_ip);
 		}
 	}
-	pthread_mutex_unlock(&(m_advp->gw_info->gw_info_lock));
+	pthread_mutex_unlock(&(m_advp->tg_info->tg_info_lock));
 }
 
 route_entry *search4rte(rte *r)
@@ -1078,23 +1151,24 @@ void process_time_event()
 	//1.check update timer
 	time_t cur_time = time(NULL);
 	if (m_advp->update_send_timer <= cur_time) {
-		print_re_list();
 		broadcast_update_msg(USUAL_UPDATE);
+		print_re_list();
 		m_advp->update_send_timer = cur_time + ROUTE_UPDATE_INTERVAL;
 	}
 
 
 	//2. check expire_timer and holddown_timer in route_entry, 
-	//if expore_timer timeout change flag to INVALID_ROUTE_ENTRY, delete 
-	//holddown entry when its holddown timer is below or equall to zero
+	//if expire_timer timeout change flag to INVALID_ROUTE_ENTRY, delete 
+	//the entry when its holddown timer is below or equall to zero
 	check_route_list();
-	//3. traverse the route entry list and print each route entry
-	//print_re_list();
-	check_gw_info();
+
+	check_tg_info();
 
 	//check whether the 3G router interface is down to up
 	//if so add the ping gateway route entry
 	check_if_status();
+	//3. traverse the route entry list and print each route entry
+	//print_re_list();
 }
 
 /**
@@ -1141,20 +1215,42 @@ void check_route_list()
 }
 
 /**
- * check wheter the gateway information is invalid
+ * check wheter the 3g gateway information is invalid
  */
-void check_gw_info()
+void check_tg_info()
 {
-	pthread_mutex_lock(&(m_advp->gw_info->gw_info_lock));
-	if (m_advp->gw_info->expire_timer <= time(NULL)) {
+	pthread_mutex_lock(&(m_advp->tg_info->tg_info_lock));
+	if (m_advp->tg_info->expire_timer <= time(NULL)) {
 		log_info("gateway expired");
-		m_advp->gw_info->rtt = 5000;
-		m_advp->gw_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+		m_advp->tg_info->rtt = MAX_RTT;
+		m_advp->tg_info->expire_timer = time(NULL) + GW_EXPIRE_INTERVAL;
+		m_advp->tg_info->expire_count++;
+	}
+
+	if (m_advp->tg_info->rtt < MAX_RTT) {
+		
+		pthread_mutex_lock(&m_advp->sate_info->cond_mutex);
+		if (m_advp->sate_info->running == 1) {
+			printf("stop running\n");
+			m_advp->sate_info->running = 0;
+		}
+		pthread_mutex_unlock(&m_advp->sate_info->cond_mutex);
+	}
+
+	if (m_advp->tg_info->expire_count == 2) {
+		m_advp->tg_info->expire_count = 0;
+		pthread_mutex_lock(&m_advp->sate_info->cond_mutex);
+		if (m_advp->sate_info->running == 0) {
+			m_advp->sate_info->running = 1;
+			pthread_cond_broadcast(&m_advp->sate_info->last_choice);
+		}
+		pthread_mutex_unlock(&m_advp->sate_info->cond_mutex);
+
 	}
 	char ip[IP_STR_LEN];
-	ip_to_str(m_advp->gw_info->default_gw_ip, ip);
-	log_info("Check gw info, rtt = %d, gw = %s", m_advp->gw_info->rtt, ip);
-	pthread_mutex_unlock(&(m_advp->gw_info->gw_info_lock));
+	ip_to_str(m_advp->tg_info->default_gw_ip, ip);
+	log_info("Check gw info, rtt = %d, gw = %s", m_advp->tg_info->rtt, ip);
+	pthread_mutex_unlock(&(m_advp->tg_info->tg_info_lock));
 }
 
 /**
@@ -1165,16 +1261,16 @@ void check_gw_info()
 void check_if_status()
 {
 	printf("check if status\n");
-	char *if_name = m_advp->gw_info->ping_if;
+	char *if_name = m_advp->tg_info->ping_if;
 	if (is_if_online(if_name)) {
-		if (m_advp->gw_info->ping_if_status == IF_OFFLINE) {
-			m_advp->gw_info->ping_if_status = IF_ONLINE;
+		if (m_advp->tg_info->ping_if_status == IF_OFFLINE) {
+			m_advp->tg_info->ping_if_status = IF_ONLINE;
 			printf("%s is down to up\n", if_name);
 			add_gw_re();
 			add_default_re();
 		}
 	} else {
-		m_advp->gw_info->ping_if_status = IF_OFFLINE;
+		m_advp->tg_info->ping_if_status = IF_OFFLINE;
 		printf("%s is offline\n", if_name);
 	}
 }
@@ -1227,31 +1323,40 @@ time_t search_nearest_timer()
 		re = re->next;
 	}
 	
-	if (m_advp->gw_info->expire_timer < shortest)
-		shortest = m_advp->gw_info->expire_timer;
+	if (m_advp->tg_info->expire_timer < shortest)
+		shortest = m_advp->tg_info->expire_timer;
 
 	return shortest;
 }
 
+/**
+ * create a 3g detector thread
+ * @return 0 on success or -1 on failure
+ */
 int create_detection_thread()
 {
 
 	pthread_t detection_thread;
 	int rv;
 	rv = pthread_create(&detection_thread, NULL, 
-		start_detection_service, (void*)m_advp->gw_info);
+		start_detection_service, (void*)m_advp->tg_info);
    	
-   	if (rv != 0) {
-   		
-   		return -1;
-   	}
+   	return rv;
+}
 
-   	return 0;
+int create_iridium_thread()
+{
+    pthread_t iridium_thread;
+    int rv;
+    
+    rv = pthread_create(&iridium_thread, NULL, start_iridium_service,
+    	(void*)m_advp->sate_info);
+
+    return rv;
 }
 
 void start_route_service()
 {
-
 	struct epoll_event *events;
 	int efd;
 
@@ -1275,8 +1380,6 @@ void start_route_service()
 		time_t now = time(NULL);
 		int timeout = abs(SECOND_TO_MILLSECOND(shortest - now));
 		
-
-
 		n = epoll_wait(efd, events, MAX_EPOLL_EVENTS, timeout);
 		debug("n = %d", n);
 		if (n > 0 ){
@@ -1301,7 +1404,7 @@ void start_route_service()
 int main(int argc, char const *argv[])
 {
 
-	assert(sizeof(rip_packet) == 6);
+	assert(sizeof(rip_packet) == 2);
 	assert(sizeof(rte) == 18);
 	int res;
 
@@ -1319,6 +1422,19 @@ int main(int argc, char const *argv[])
 	res = create_detection_thread();
 	if (res == -1) {
 		log_err("Failed to create detection thread");
+		exit(EXIT_FAILURE);
+	}
+
+	res = create_iridium_thread();
+	if (res == -1) {
+		log_err("Failed to create iridium thread");
+		exit(EXIT_FAILURE);
+	}
+
+	res = start_pcap_service(m_advp->sate_info);
+	
+	if (res == -1) {
+		log_err("Failed to create pcap threads");
 		exit(EXIT_FAILURE);
 	}
 	start_route_service();
