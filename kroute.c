@@ -89,7 +89,7 @@ int kernel_route(int command, route_entry *re, route_entry *new_re)
 			attr->rta_type = RTA_OIF;
 			attr->rta_len = sizeof(struct rtattr) + 4;
 			memcpy(((char *) attr) + sizeof(struct rtattr),
-			       (int *) &(re->recvif->ifnumber), 1);
+			       (int *) &(re->ifnumber), 1);
 			len += attr->rta_len;
 		
 			/* Next hop */

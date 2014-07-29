@@ -7,6 +7,8 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include "hashmap.h"
+#include "packet_sniffer.h"
+#include "queue.h"
 
 typedef struct interface {
 	char ifname[IFNAMSIZ];
@@ -44,7 +46,6 @@ typedef struct rip_packet {
 	// uint8_t rtt;
 	// uint8_t payload;
 	// uint8_t sat_sigal;
-	uint32_t send_time;
 	uint16_t rtt;
 	rte routes[0];
 } rip_packet;
@@ -75,7 +76,7 @@ typedef struct route_entry {
 	struct route_entry *next;
 } route_entry;
 
-typedef struct gateway_info {
+typedef struct tg_info {
 	char ping_if[IFNAMSIZ];
 	uint8_t ping_if_status;
 	in_addr_t ping_ip;
@@ -85,8 +86,27 @@ typedef struct gateway_info {
 	int default_gw_ifnumber;
 	uint16_t rtt;
 	time_t expire_timer;
-	pthread_mutex_t gw_info_lock;
-} gateway_info;
+	uint8_t expire_count;
+	pthread_mutex_t tg_info_lock;
+} tg_info;
+
+#define MAX_PCAP_ROULE_LENGTH 50
+
+typedef struct sate_info_entry {
+	char interface[IFNAMSIZ];
+	char rule[MAX_PCAP_ROULE_LENGTH];
+
+} sate_info_entry;
+
+typedef struct sate_info {
+	int pcap_if_count;
+	int pipe_fds[2];
+	queue *req_queue;
+	int running;
+	pthread_cond_t last_choice;
+	pthread_mutex_t cond_mutex;
+	sate_info_entry entries[0];
+} sate_info;
 
 
 typedef struct advp {
@@ -94,8 +114,10 @@ typedef struct advp {
 	interface *if_list_head;
 	route_entry *re_list_head;
 	route_entry *default_re;
-	gateway_info *gw_info;
+	tg_info *tg_info;
+	sate_info *sate_info;
 	hashmap *neighbor_hp;
+
 } advp;
 
 int modify_default_re(int ifnumber, in_addr_t sender_ip);
